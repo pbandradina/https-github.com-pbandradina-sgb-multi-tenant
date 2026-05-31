@@ -1,0 +1,6 @@
+{
+  "name": "Gestão de Escalas de Bombeiros",
+  "description": "Sistema integrado de gerenciamento de quarteis de bombeiros, escalas de plantão em tempo real, controle de frotas e controle de efetivo.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,235 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Accent brand colors */
+  --color-brand-red: #dc2626;
+  --color-brand-red-dark: #991b1b;
+  --color-brand-slate: #0a0a0b;
+
+  /* Redefining standard colors for a pristine, premium Elegant Dark theme */
+  --color-white: #161618;
+  --color-slate-50: #0a0a0b;
+  --color-slate-100: rgba(255, 255, 255, 0.05);
+  --color-slate-200: rgba(255, 255, 255, 0.08);
+  --color-slate-300: #d1d1d6;
+  --color-slate-350: #b0b0b5;
+  --color-slate-400: #8e8e93;
+  --color-slate-500: #7a7a7f;
+  --color-slate-600: #4a4a4f;
+  --color-slate-700: #c7c7cc;
+  --color-slate-800: #f2f2f7;
+  --color-slate-900: #111113;
+  --color-slate-950: #0a0a0b;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #0a0a0b !important;
+  color: #e0e0e0 !important;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Base style overrides to force elegant dark backgrounds on standard browsers */
+html {
+  background-color: #0a0a0b;
+}
+
+/* Class overrides to map existing Light theme elements to Elegant Dark equivalents */
+.bg-white {
+  background-color: #161618 !important;
+  border-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+.bg-slate-50 {
+  background-color: #0a0a0b !important;
+}
+
+.bg-slate-100 {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+.border-slate-50 {
+  border-color: rgba(255, 255, 255, 0.03) !important;
+}
+
+.border-slate-100, .border-slate-200, .border-slate-150 {
+  border-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+/* Text overrides to preserve legibility on dark backgrounds */
+.text-slate-805, .text-slate-800, .text-slate-900 {
+  color: #ffffff !important;
+}
+
+.text-slate-700, .text-slate-600 {
+  color: #e0e0e0 !important;
+}
+
+.text-slate-505, .text-slate-500 {
+  color: #929298 !important;
+}
+
+.text-slate-400 {
+  color: #838389 !important;
+}
+
+/* Custom visual styling: Glassmorphism and glows with Crimson Accents */
+.glass-effect {
+  background: rgba(22, 22, 24, 0.8) !important;
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.glow-red {
+  box-shadow: 0 4px 20px rgba(220, 38, 38, 0.25);
+}
+
+/* Forms, controls, inputs, selects, and textareas */
+input[type="text"],
+input[type="date"],
+input[type="tel"],
+select,
+textarea {
+  background-color: #111113 !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: #ffffff !important;
+  border-radius: 0.5rem;
+  transition: all 0.2s ease-in-out;
+}
+
+input[type="text"]::placeholder,
+textarea::placeholder {
+  color: #6a6a6f !important;
+}
+
+input[type="text"]:focus,
+input[type="date"]:focus,
+input[type="tel"]:focus,
+select:focus,
+textarea:focus {
+  border-color: #dc2626 !important;
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2) !important;
+  outline: none;
+}
+
+option {
+  background-color: #111113 !important;
+  color: #ffffff !important;
+}
+
+/* Tables, headers, grid row hover effects */
+table {
+  border-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+thead, tr {
+  border-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+th {
+  background-color: rgba(255, 255, 255, 0.01) !important;
+  color: #929298 !important;
+  font-weight: 600;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+}
+
+td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+}
+
+tr:hover {
+  background-color: rgba(255, 255, 255, 0.01) !important;
+}
+
+/* Badge states & Status panels style overrides for fine-grained elegance */
+.bg-red-50 {
+  background-color: rgba(220, 38, 38, 0.12) !important;
+  color: #fca5a5 !important;
+}
+.bg-emerald-50 {
+  background-color: rgba(16, 185, 129, 0.12) !important;
+  color: #6ee7b7 !important;
+}
+.bg-amber-50 {
+  background-color: rgba(245, 158, 11, 0.12) !important;
+  color: #fde047 !important;
+}
+.bg-rose-50 {
+  background-color: rgba(244, 63, 94, 0.12) !important;
+  color: #fda4af !important;
+}
+.bg-blue-50 {
+  background-color: rgba(59, 130, 246, 0.12) !important;
+  color: #93c5fd !important;
+}
+
+.text-emerald-700 {
+  color: #34d399 !important;
+}
+.border-emerald-100 {
+  border-color: rgba(16, 185, 129, 0.25) !important;
+}
+
+.text-amber-700 {
+  color: #fbbf24 !important;
+}
+.border-amber-100 {
+  border-color: rgba(245, 158, 11, 0.25) !important;
+}
+
+.text-rose-700 {
+  color: #f87171 !important;
+}
+.border-rose-100 {
+  border-color: rgba(244, 63, 94, 0.25) !important;
+}
+
+/* Modals, custom overlay highlights */
+.modal-overlay {
+  background-color: rgba(10, 10, 11, 0.8) !important;
+  backdrop-filter: blur(8px);
+}
+
+/* Modern clean scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0b;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Custom Print styles to export the scale as a perfect PDF */
+@media print {
+  body {
+    background-color: white !important;
+    color: black !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  .print-card {
+    border: 1px solid #000 !important;
+    box-shadow: none !important;
+    background: white !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+}
