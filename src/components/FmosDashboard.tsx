@@ -4,6 +4,7 @@ import {
   Clock, RefreshCw, BarChart2, ShieldCheck, HelpCircle
 } from "lucide-react";
 import { Bombeiro, Afastamento, Fmo } from "../types";
+import { describeError } from "../api";
 
 interface FmosDashboardProps {
   selectedQuartelId: string;
@@ -217,6 +218,7 @@ export default function FmosDashboard({
   const [searchTerm, setSearchTerm] = useState("");
   const [teamFilter, setTeamFilter] = useState("TODAS");
   const [showFmoHelper, setShowFmoHelper] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Active platoon state
   const activeBombeiros = useMemo(() => {
@@ -251,7 +253,13 @@ export default function FmosDashboard({
   // Handle deletions
   const handleDelete = async (id: string) => {
     if (!isAdmin || !onDeleteFmo || !confirm("Tem certeza que deseja remover este registro de folga?")) return;
-    await onDeleteFmo(id);
+    setDeleteError(null);
+    try {
+      await onDeleteFmo(id);
+    } catch (err) {
+      console.error("Erro ao remover registro de FMO:", err);
+      setDeleteError(`Erro ao remover registro de folga: ${describeError(err)}`);
+    }
   };
 
   // Top overall stats
@@ -271,7 +279,13 @@ export default function FmosDashboard({
 
   return (
     <div className="space-y-6">
-      
+
+      {deleteError && (
+        <div className="bg-red-500/10 border border-red-500/30 text-red-300 text-xs font-bold px-3 py-2 rounded-xl">
+          {deleteError}
+        </div>
+      )}
+
       {/* Header and Live stats indicator */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>

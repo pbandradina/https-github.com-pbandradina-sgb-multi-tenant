@@ -5,6 +5,7 @@ import {
   MessageSquare, UserCheck, ChevronRight, ChevronLeft, Calendar
 } from "lucide-react";
 import { Bombeiro, Escala, Viatura, Ocorrencia, MuralPost, Afastamento, Fmo } from "../types";
+import { describeError } from "../api";
 
 const formatDate = (d: Date | string) => {
   return new Date(d).toISOString().split("T")[0];
@@ -48,6 +49,8 @@ export default function Dashboard({
   const [newNoticeContent, setNewNoticeContent] = useState("");
   const [noticeAuthorRe, setNoticeAuthorRe] = useState("");
   const [isSubmitNoticeLoading, setIsSubmitNoticeLoading] = useState(false);
+  const [noticeError, setNoticeError] = useState<string | null>(null);
+  const [folgaError, setFolgaError] = useState<string | null>(null);
 
   // Interactive Date Selector for Shift Roster & Admin Card
   const [dashboardDate, setDashboardDate] = useState<Date>(() => new Date());
@@ -135,7 +138,11 @@ export default function Dashboard({
 
   const handleCreateNotice = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newNoticeTitle || !newNoticeContent) return;
+    setNoticeError(null);
+    if (!newNoticeTitle || !newNoticeContent) {
+      setNoticeError("Informe título e conteúdo do aviso.");
+      return;
+    }
     setIsSubmitNoticeLoading(true);
     try {
       await onCreateMural(newNoticeTitle, newNoticeContent, noticeAuthorRe);
@@ -143,7 +150,8 @@ export default function Dashboard({
       setNewNoticeContent("");
       setNoticeAuthorRe("");
     } catch (err) {
-      console.error(err);
+      console.error("Erro ao fixar aviso:", err);
+      setNoticeError(describeError(err));
     } finally {
       setIsSubmitNoticeLoading(false);
     }
@@ -210,6 +218,7 @@ export default function Dashboard({
   // Handle Administrative leave changes
   const handleAdminLeaveChange = async (bombeiroId: string, value: string) => {
     if (!onAddAfastamento || !onDeleteAfastamento) return;
+    setFolgaError(null);
     try {
       // Find matches for same exact firefighter on same date
       const existingLeaves = afastamentos.filter(af => 
@@ -252,6 +261,7 @@ export default function Dashboard({
       }
     } catch (e) {
       console.error("Erro ao alterar folga administrativa:", e);
+      setFolgaError(describeError(e));
     }
   };
 
@@ -464,6 +474,12 @@ export default function Dashboard({
                 Membros atrelados ao expediente administrativo semanal (segunda a sexta-feira das 08h às 18h).
               </p>
             </div>
+
+            {folgaError && (
+              <div className="mb-3 bg-red-50 border border-red-200 text-red-700 text-[11px] font-bold px-3 py-2 rounded-lg">
+                {folgaError}
+              </div>
+            )}
 
             {adminBombeiros.length === 0 ? (
               <div className="py-6 text-center text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
@@ -721,6 +737,12 @@ export default function Dashboard({
                     <Plus className="w-3 h-3" /> Fixar
                   </button>
                 </div>
+
+                {noticeError && (
+                  <div className="bg-red-50 border border-red-200 text-red-700 text-[11px] font-bold px-2 py-1.5 rounded">
+                    {noticeError}
+                  </div>
+                )}
               </form>
             ) : (
               <div className="mb-4 bg-amber-50/50 border border-amber-200/50 p-3 rounded-xl text-[11px] text-amber-700 font-medium flex items-center gap-2">

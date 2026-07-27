@@ -1,4 +1,4 @@
-import express from "express";
+import express, { NextFunction, Request, RequestHandler, Response } from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import pg from "pg";
@@ -16,6 +16,52 @@ const dbUrl = process.env.SUPABASE_DB_URL;
 let pool: pg.Pool | null = null;
 let isDbConnected = false;
 let dbConnectionStringRef = "";
+let dbInitError: string | null = null;
+
+// Erro com status HTTP e mensagem destinada ao cliente
+class HttpError extends Error {
+  constructor(readonly status: number, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "HttpError";
+  }
+}
+
+const describeError = (err: unknown): string => {
+  if (err instanceof Error) {
+    const cause = err.cause !== undefined ? ` (causa: ${describeError(err.cause)})` : "";
+    return `${err.message}${cause}`;
+  }
+  return String(err);
+};
+
+// O Express 4 não captura rejeições de handlers async: sem este wrapper a
+// requisição fica pendurada e o erro só aparece como unhandledRejection.
+const asyncHandler =
+  (handler: (req: Request, res: Response) => Promise<unknown>): RequestHandler =>
+  (req, res, next) => {
+    handler(req, res).catch(next);
+  };
+
+const requireFields = (body: Record<string, unknown>, fields: string[]) => {
+  const missing = fields.filter(field => {
+    const value = body[field];
+    return value === undefined || value === null || value === "";
+  });
+  if (missing.length > 0) {
+    throw new HttpError(400, `Campos obrigatórios ausentes: ${missing.join(", ")}`);
+  }
+};
+
+// Executa a query informando qual operação falhou, em vez de mascarar o erro
+const runQuery = async (context: string, query: () => Promise<pg.QueryResult>) => {
+  try {
+    return await query();
+  } catch (err) {
+    throw new HttpError(500, context, { cause: err });
+  }
+};
+
+const requireDb = (): pg.Pool | null => (isDbConnected && pool ? pool : null);
 
 // Graceful Mock Fallback Data (In-Memory database) to guarantee flawless reliability
 let mockQuarteis = [
@@ -50,6 +96,9 @@ let mockBombeiros = [
 // Helper to convert date to YYYY-MM-DD
 const formatDate = (d: Date | string) => {
   const date = new Date(d);
+  if (Number.isNaN(date.getTime())) {
+    throw new HttpError(400, `Data inválida: ${JSON.stringify(d)}`);
+  }
   return date.toISOString().split("T")[0];
 };
 
@@ -110,6 +159,11 @@ async function initDb() {
     pool = new pg.Pool({
       connectionString: dbUrl,
       ssl: { rejectUnauthorized: false } // Supabase exige SSL
+    });
+
+    // Sem este listener um erro em cliente idle derruba o processo
+    pool.on("error", err => {
+      console.error("Erro inesperado em cliente idle do pool PostgreSQL:", describeError(err));
     });
 
     // Testar conexão
@@ -280,11 +334,17 @@ async function initDb() {
     console.error("Erro ao conectar ou configurar o PostgreSQL do Supabase:", err);
     console.warn("Utilizando persistência Em Memória temporária para manter a aplicação 100% ativa!");
     isDbConnected = false;
+    dbInitError = describeError(err);
     return false;
   }
 }
 
-initDb();
+initDb().catch(err => {
+  // initDb já trata suas falhas; um erro aqui é inesperado e não pode ser perdido
+  dbInitError = describeError(err);
+  isDbConnected = false;
+  console.error("Falha não tratada ao inicializar o banco de dados:", err);
+});
 
 // --- ENDPOINTS DA API ---
 
@@ -294,65 +354,59 @@ app.get("/api/status", (req, res) => {
     connected: isDbConnected,
     database: "PostgreSQL - Supabase",
     connectionString: dbConnectionStringRef || "In-Memory Fallback Client",
+    // Expõe o motivo da degradação para Em Memória em vez de deixá-lo apenas no log
+    error: dbInitError,
     time: new Date().toISOString()
   });
 });
 
 // 2. Quarteis (Unidades)
-app.get("/api/quarteis", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM quarteis ORDER BY nome");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockQuarteis);
-});
+app.get("/api/quarteis", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockQuarteis);
+  const result = await runQuery("Erro ao consultar quartéis.", () => db.query("SELECT * FROM quarteis ORDER BY nome"));
+  res.json(result.rows);
+}));
 
 // 3. Bombeiros (Efetivo)
-app.get("/api/bombeiros", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM bombeiros ORDER BY posto_grad ASC, nome ASC");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockBombeiros);
-});
+app.get("/api/bombeiros", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockBombeiros);
+  const result = await runQuery("Erro ao consultar bombeiros.", () =>
+    db.query("SELECT * FROM bombeiros ORDER BY posto_grad ASC, nome ASC"));
+  res.json(result.rows);
+}));
 
-app.post("/api/bombeiros", async (req, res) => {
+app.post("/api/bombeiros", asyncHandler(async (req, res) => {
+  requireFields(req.body, ["quartel_id", "nome", "nome_guerra", "re", "posto_grad"]);
   const { id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe } = req.body;
   const newId = id || "b_" + Date.now();
-  
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(`
-        INSERT INTO bombeiros (id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          nome = EXCLUDED.nome,
-          nome_guerra = EXCLUDED.nome_guerra,
-          re = EXCLUDED.re,
-          posto_grad = EXCLUDED.posto_grad,
-          status = EXCLUDED.status,
-          telefone = EXCLUDED.telefone,
-          especialidades = EXCLUDED.especialidades,
-          data_inicio_servico = EXCLUDED.data_inicio_servico,
-          regime = EXCLUDED.regime,
-          equipe = EXCLUDED.equipe
-      `, [newId, quartel_id, nome, nome_guerra, re, posto_grad, status || "Ativo", telefone, especialidades, data_inicio_servico, regime || "PRONTIDÃO", equipe || ""]);
-      
-      const updated = await pool.query("SELECT * FROM bombeiros WHERE id = $1", [newId]);
-      return res.json(updated.rows[0]);
-    } catch (e) {
-      console.error("Erro ao salvar bombeiro:", e);
-      return res.status(500).json({ error: "Erro ao salvar bombeiro" });
+
+  const db = requireDb();
+  if (db) {
+    await runQuery("Erro ao salvar bombeiro.", () => db.query(`
+      INSERT INTO bombeiros (id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      ON CONFLICT (id) DO UPDATE SET
+        quartel_id = EXCLUDED.quartel_id,
+        nome = EXCLUDED.nome,
+        nome_guerra = EXCLUDED.nome_guerra,
+        re = EXCLUDED.re,
+        posto_grad = EXCLUDED.posto_grad,
+        status = EXCLUDED.status,
+        telefone = EXCLUDED.telefone,
+        especialidades = EXCLUDED.especialidades,
+        data_inicio_servico = EXCLUDED.data_inicio_servico,
+        regime = EXCLUDED.regime,
+        equipe = EXCLUDED.equipe
+    `, [newId, quartel_id, nome, nome_guerra, re, posto_grad, status || "Ativo", telefone, especialidades, data_inicio_servico, regime || "PRONTIDÃO", equipe || ""]));
+
+    const updated = await runQuery("Erro ao recarregar bombeiro salvo.", () =>
+      db.query("SELECT * FROM bombeiros WHERE id = $1", [newId]));
+    if (updated.rows.length === 0) {
+      throw new HttpError(500, "Bombeiro não encontrado após a gravação.");
     }
+    return res.json(updated.rows[0]);
   }
 
   // Fallback Local Cache
@@ -364,63 +418,49 @@ app.post("/api/bombeiros", async (req, res) => {
     mockBombeiros.push(data);
   }
   res.json(data);
-});
+}));
 
-app.delete("/api/bombeiros/:id", async (req, res) => {
+app.delete("/api/bombeiros/:id", asyncHandler(async (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM bombeiros WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar" });
-    }
+  const db = requireDb();
+  if (db) {
+    const result = await runQuery("Erro ao deletar bombeiro.", () =>
+      db.query("DELETE FROM bombeiros WHERE id = $1", [id]));
+    return res.json({ success: true, deleted: result.rowCount ?? 0 });
   }
+  const before = mockBombeiros.length;
   mockBombeiros = mockBombeiros.filter(b => b.id !== id);
-  res.json({ success: true });
-});
+  res.json({ success: true, deleted: before - mockBombeiros.length });
+}));
 
 // 4. Escalas de Plantão (Shifts)
-app.get("/api/escalas", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM escalas ORDER BY data DESC");
-      // Map postgres date properly (strip timestamp text)
-      const mapped = result.rows.map(row => ({
-        ...row,
-        data: formatDate(row.data)
-      }));
-      return res.json(mapped);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockEscalas);
-});
+app.get("/api/escalas", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockEscalas);
+  const result = await runQuery("Erro ao consultar escalas.", () => db.query("SELECT * FROM escalas ORDER BY data DESC"));
+  // Map postgres date properly (strip timestamp text)
+  res.json(result.rows.map(row => ({ ...row, data: formatDate(row.data) })));
+}));
 
-app.post("/api/escalas", async (req, res) => {
+app.post("/api/escalas", asyncHandler(async (req, res) => {
+  requireFields(req.body, ["quartel_id", "data", "bombeiro_id", "funcao", "periodo"]);
   const { id, quartel_id, data, bombeiro_id, funcao, periodo } = req.body;
   const newId = id || "e_" + Date.now();
   const rawDate = formatDate(data);
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(`
-        INSERT INTO escalas (id, quartel_id, data, bombeiro_id, funcao, periodo)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          data = EXCLUDED.data,
-          bombeiro_id = EXCLUDED.bombeiro_id,
-          funcao = EXCLUDED.funcao,
-          periodo = EXCLUDED.periodo
-      `, [newId, quartel_id, rawDate, bombeiro_id, funcao, periodo]);
-      return res.json({ id: newId, quartel_id, data: rawDate, bombeiro_id, funcao, periodo });
-    } catch (e) {
-      console.error("Erro ao salvar escala:", e);
-      return res.status(500).json({ error: "Erro ao salvar escala" });
-    }
+  const db = requireDb();
+  if (db) {
+    await runQuery("Erro ao salvar escala.", () => db.query(`
+      INSERT INTO escalas (id, quartel_id, data, bombeiro_id, funcao, periodo)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (id) DO UPDATE SET
+        quartel_id = EXCLUDED.quartel_id,
+        data = EXCLUDED.data,
+        bombeiro_id = EXCLUDED.bombeiro_id,
+        funcao = EXCLUDED.funcao,
+        periodo = EXCLUDED.periodo
+    `, [newId, quartel_id, rawDate, bombeiro_id, funcao, periodo]));
+    return res.json({ id: newId, quartel_id, data: rawDate, bombeiro_id, funcao, periodo });
   }
 
   // Fallback Local
@@ -432,101 +472,91 @@ app.post("/api/escalas", async (req, res) => {
     mockEscalas.push(dataset);
   }
   res.json(dataset);
-});
+}));
 
-app.delete("/api/escalas/:id", async (req, res) => {
+app.delete("/api/escalas/:id", asyncHandler(async (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM escalas WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar" });
-    }
+  const db = requireDb();
+  if (db) {
+    const result = await runQuery("Erro ao deletar escala.", () =>
+      db.query("DELETE FROM escalas WHERE id = $1", [id]));
+    return res.json({ success: true, deleted: result.rowCount ?? 0 });
   }
+  const before = mockEscalas.length;
   mockEscalas = mockEscalas.filter(e => e.id !== id);
-  res.json({ success: true });
-});
+  res.json({ success: true, deleted: before - mockEscalas.length });
+}));
 
 // 5. Viaturas (Fleet)
-app.get("/api/viaturas", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM viaturas ORDER BY codigo");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockViaturas);
-});
+app.get("/api/viaturas", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockViaturas);
+  const result = await runQuery("Erro ao consultar viaturas.", () => db.query("SELECT * FROM viaturas ORDER BY codigo"));
+  res.json(result.rows);
+}));
 
-app.put("/api/viaturas/:id", async (req, res) => {
+app.put("/api/viaturas/:id", asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { status, escala_atual } = req.body;
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(
-        "UPDATE viaturas SET status = $1, escala_atual = $2 WHERE id = $3",
-        [status, escala_atual, id]
-      );
-      const updated = await pool.query("SELECT * FROM viaturas WHERE id = $1", [id]);
-      return res.json(updated.rows[0]);
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao atualizar viatura" });
+  const db = requireDb();
+  if (db) {
+    const updateResult = await runQuery("Erro ao atualizar viatura.", () => db.query(
+      "UPDATE viaturas SET status = $1, escala_atual = $2 WHERE id = $3",
+      [status, escala_atual, id]
+    ));
+    if (updateResult.rowCount === 0) {
+      throw new HttpError(404, "Viatura não encontrada.");
     }
+    const updated = await runQuery("Erro ao recarregar viatura atualizada.", () =>
+      db.query("SELECT * FROM viaturas WHERE id = $1", [id]));
+    return res.json(updated.rows[0]);
   }
 
   const index = mockViaturas.findIndex(v => v.id === id);
-  if (index > -1) {
-    mockViaturas[index] = { ...mockViaturas[index], status, escala_atual };
-    return res.json(mockViaturas[index]);
+  if (index === -1) {
+    throw new HttpError(404, "Viatura não encontrada.");
   }
-  res.status(404).json({ error: "Viatura não encontrada" });
-});
+  mockViaturas[index] = { ...mockViaturas[index], status, escala_atual };
+  res.json(mockViaturas[index]);
+}));
 
 // 6. Ocorrências (Dispatches)
-app.get("/api/ocorrencias", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM ocorrencias ORDER BY criado_em DESC");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockOcorrencias);
-});
+app.get("/api/ocorrencias", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockOcorrencias);
+  const result = await runQuery("Erro ao consultar ocorrências.", () =>
+    db.query("SELECT * FROM ocorrencias ORDER BY criado_em DESC"));
+  res.json(result.rows);
+}));
 
-app.post("/api/ocorrencias", async (req, res) => {
+app.post("/api/ocorrencias", asyncHandler(async (req, res) => {
+  requireFields(req.body, ["quartel_id", "tipo", "endereco"]);
   const { id, quartel_id, tipo, endereco, viatura_id, status, historico, criado_em, fechado_em } = req.body;
   const newId = id || "o_" + Date.now();
   const finalCode = "OCO-" + new Date().getFullYear() + "-" + Math.floor(100 + Math.random() * 900);
   const startTime = criado_em || new Date().toISOString();
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(`
-        INSERT INTO ocorrencias (id, quartel_id, codigo, tipo, endereco, viatura_id, status, criado_em, fechado_em, historico)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (id) DO UPDATE SET
-          tipo = EXCLUDED.tipo,
-          endereco = EXCLUDED.endereco,
-          viatura_id = EXCLUDED.viatura_id,
-          status = EXCLUDED.status,
-          fechado_em = EXCLUDED.fechado_em,
-          historico = EXCLUDED.historico
-      `, [newId, quartel_id, finalCode, tipo, endereco, viatura_id, status || "Ativa", startTime, fechado_em, historico]);
-      
-      const loaded = await pool.query("SELECT * FROM ocorrencias WHERE id = $1", [newId]);
-      return res.json(loaded.rows[0]);
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao registrar ocorrência" });
+  const db = requireDb();
+  if (db) {
+    await runQuery("Erro ao registrar ocorrência.", () => db.query(`
+      INSERT INTO ocorrencias (id, quartel_id, codigo, tipo, endereco, viatura_id, status, criado_em, fechado_em, historico)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      ON CONFLICT (id) DO UPDATE SET
+        tipo = EXCLUDED.tipo,
+        endereco = EXCLUDED.endereco,
+        viatura_id = EXCLUDED.viatura_id,
+        status = EXCLUDED.status,
+        fechado_em = EXCLUDED.fechado_em,
+        historico = EXCLUDED.historico
+    `, [newId, quartel_id, finalCode, tipo, endereco, viatura_id, status || "Ativa", startTime, fechado_em, historico]));
+
+    const loaded = await runQuery("Erro ao recarregar ocorrência registrada.", () =>
+      db.query("SELECT * FROM ocorrencias WHERE id = $1", [newId]));
+    if (loaded.rows.length === 0) {
+      throw new HttpError(500, "Ocorrência não encontrada após o registro.");
     }
+    return res.json(loaded.rows[0]);
   }
 
   const existingIndex = mockOcorrencias.findIndex(o => o.id === newId);
@@ -549,130 +579,116 @@ app.post("/api/ocorrencias", async (req, res) => {
     mockOcorrencias.unshift(data);
   }
   res.json(data);
-});
+}));
 
-app.put("/api/ocorrencias/:id/fechar", async (req, res) => {
+app.put("/api/ocorrencias/:id/fechar", asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { historico } = req.body;
   const now = new Date().toISOString();
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(
-        "UPDATE ocorrencias SET status = 'Finalizada', fechado_em = $1, historico = $2 WHERE id = $3",
-        [now, historico, id]
-      );
-      const loaded = await pool.query("SELECT * FROM ocorrencias WHERE id = $1", [id]);
-      return res.json(loaded.rows[0]);
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao fechar ocorrência" });
+  const db = requireDb();
+  if (db) {
+    const updateResult = await runQuery("Erro ao fechar ocorrência.", () => db.query(
+      "UPDATE ocorrencias SET status = 'Finalizada', fechado_em = $1, historico = $2 WHERE id = $3",
+      [now, historico, id]
+    ));
+    if (updateResult.rowCount === 0) {
+      throw new HttpError(404, "Ocorrência não encontrada.");
     }
+    const loaded = await runQuery("Erro ao recarregar ocorrência fechada.", () =>
+      db.query("SELECT * FROM ocorrencias WHERE id = $1", [id]));
+    return res.json(loaded.rows[0]);
   }
 
   const index = mockOcorrencias.findIndex(o => o.id === id);
-  if (index > -1) {
-    mockOcorrencias[index].status = "Finalizada";
-    mockOcorrencias[index].fechado_em = now;
-    if (historico) mockOcorrencias[index].historico = historico;
-    return res.json(mockOcorrencias[index]);
+  if (index === -1) {
+    throw new HttpError(404, "Ocorrência não encontrada.");
   }
-  res.status(404).json({ error: "Ocorrência não encontrada" });
-});
+  mockOcorrencias[index].status = "Finalizada";
+  mockOcorrencias[index].fechado_em = now;
+  if (historico) mockOcorrencias[index].historico = historico;
+  res.json(mockOcorrencias[index]);
+}));
 
 // 7. Mural de Avisos
-app.get("/api/mural", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM mural_avisos ORDER BY criado_em DESC");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockMural);
-});
+app.get("/api/mural", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockMural);
+  const result = await runQuery("Erro ao consultar mural de avisos.", () =>
+    db.query("SELECT * FROM mural_avisos ORDER BY criado_em DESC"));
+  res.json(result.rows);
+}));
 
-app.post("/api/mural", async (req, res) => {
+app.post("/api/mural", asyncHandler(async (req, res) => {
+  requireFields(req.body, ["title", "content"]);
   const { title, content, authorRe, quartelId } = req.body;
   const id = "m_" + Date.now();
   const timestamp = new Date().toISOString();
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(
-        "INSERT INTO mural_avisos (id, quartel_id, titulo, conteudo, bombeiro_re, criado_em) VALUES ($1, $2, $3, $4, $5, $6)",
-        [id, quartelId || "q1", title, content, authorRe || "145.230-1", timestamp]
-      );
-      return res.json({ id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe, criado_em: timestamp });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao registrar aviso" });
-    }
+  const db = requireDb();
+  if (db) {
+    await runQuery("Erro ao registrar aviso.", () => db.query(
+      "INSERT INTO mural_avisos (id, quartel_id, titulo, conteudo, bombeiro_re, criado_em) VALUES ($1, $2, $3, $4, $5, $6)",
+      [id, quartelId || "q1", title, content, authorRe || "145.230-1", timestamp]
+    ));
+    return res.json({ id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe, criado_em: timestamp });
   }
 
   const post = { id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe || "145.230-1", criado_em: timestamp };
   mockMural.unshift(post);
   res.json(post);
-});
+}));
 
-app.delete("/api/mural/:id", async (req, res) => {
+app.delete("/api/mural/:id", asyncHandler(async (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM mural_avisos WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar" });
-    }
+  const db = requireDb();
+  if (db) {
+    const result = await runQuery("Erro ao deletar aviso.", () =>
+      db.query("DELETE FROM mural_avisos WHERE id = $1", [id]));
+    return res.json({ success: true, deleted: result.rowCount ?? 0 });
   }
+  const before = mockMural.length;
   mockMural = mockMural.filter(m => m.id !== id);
-  res.json({ success: true });
-});
+  res.json({ success: true, deleted: before - mockMural.length });
+}));
 
 // --- AFASTAMENTOS ENDPOINTS ---
-app.get("/api/afastamentos", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM afastamentos ORDER BY data_inicio DESC");
-      const mapped = result.rows.map(row => ({
-        ...row,
-        data_inicio: formatDate(row.data_inicio),
-        data_fim: formatDate(row.data_fim)
-      }));
-      return res.json(mapped);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockAfastamentos);
-});
+app.get("/api/afastamentos", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockAfastamentos);
+  const result = await runQuery("Erro ao consultar afastamentos.", () =>
+    db.query("SELECT * FROM afastamentos ORDER BY data_inicio DESC"));
+  res.json(result.rows.map(row => ({
+    ...row,
+    data_inicio: formatDate(row.data_inicio),
+    data_fim: formatDate(row.data_fim)
+  })));
+}));
 
-app.post("/api/afastamentos", async (req, res) => {
+app.post("/api/afastamentos", asyncHandler(async (req, res) => {
+  requireFields(req.body, ["quartel_id", "bombeiro_id", "data_inicio", "data_fim", "tipo"]);
   const { id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa } = req.body;
   const newId = id || "af_" + Date.now();
   const rawStart = formatDate(data_inicio);
   const rawEnd = formatDate(data_fim);
+  if (rawEnd < rawStart) {
+    throw new HttpError(400, "A data de término do afastamento não pode ser anterior à data de início.");
+  }
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(`
-        INSERT INTO afastamentos (id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          bombeiro_id = EXCLUDED.bombeiro_id,
-          data_inicio = EXCLUDED.data_inicio,
-          data_fim = EXCLUDED.data_fim,
-          tipo = EXCLUDED.tipo,
-          justificativa = EXCLUDED.justificativa
-      `, [newId, quartel_id, bombeiro_id, rawStart, rawEnd, tipo, justificativa]);
-      return res.json({ id: newId, quartel_id, bombeiro_id, data_inicio: rawStart, data_fim: rawEnd, tipo, justificativa });
-    } catch (e) {
-      console.error("Erro ao salvar afastamento:", e);
-      return res.status(500).json({ error: "Erro ao salvar afastamento" });
-    }
+  const db = requireDb();
+  if (db) {
+    await runQuery("Erro ao salvar afastamento.", () => db.query(`
+      INSERT INTO afastamentos (id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (id) DO UPDATE SET
+        quartel_id = EXCLUDED.quartel_id,
+        bombeiro_id = EXCLUDED.bombeiro_id,
+        data_inicio = EXCLUDED.data_inicio,
+        data_fim = EXCLUDED.data_fim,
+        tipo = EXCLUDED.tipo,
+        justificativa = EXCLUDED.justificativa
+    `, [newId, quartel_id, bombeiro_id, rawStart, rawEnd, tipo, justificativa]));
+    return res.json({ id: newId, quartel_id, bombeiro_id, data_inicio: rawStart, data_fim: rawEnd, tipo, justificativa });
   }
 
   // Fallback Local Cache
@@ -684,61 +700,47 @@ app.post("/api/afastamentos", async (req, res) => {
     mockAfastamentos.push(dataset);
   }
   res.json(dataset);
-});
+}));
 
-app.delete("/api/afastamentos/:id", async (req, res) => {
+app.delete("/api/afastamentos/:id", asyncHandler(async (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM afastamentos WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar afastamento" });
-    }
+  const db = requireDb();
+  if (db) {
+    const result = await runQuery("Erro ao deletar afastamento.", () =>
+      db.query("DELETE FROM afastamentos WHERE id = $1", [id]));
+    return res.json({ success: true, deleted: result.rowCount ?? 0 });
   }
+  const before = mockAfastamentos.length;
   mockAfastamentos = mockAfastamentos.filter(af => af.id !== id);
-  res.json({ success: true });
-});
+  res.json({ success: true, deleted: before - mockAfastamentos.length });
+}));
 
 // --- FMOS ENDPOINTS ---
-app.get("/api/fmos", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM fmos ORDER BY data DESC");
-      const mapped = result.rows.map(row => ({
-        ...row,
-        data: formatDate(row.data)
-      }));
-      return res.json(mapped);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockFmos);
-});
+app.get("/api/fmos", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) return res.json(mockFmos);
+  const result = await runQuery("Erro ao consultar FMOs.", () => db.query("SELECT * FROM fmos ORDER BY data DESC"));
+  res.json(result.rows.map(row => ({ ...row, data: formatDate(row.data) })));
+}));
 
-app.post("/api/fmos", async (req, res) => {
+app.post("/api/fmos", asyncHandler(async (req, res) => {
+  requireFields(req.body, ["quartel_id", "bombeiro_id", "data"]);
   const { id, quartel_id, bombeiro_id, data, justificativa } = req.body;
   const newId = id || "fmo_" + Date.now();
   const rawDate = formatDate(data);
 
-  if (isDbConnected && pool) {
-    try {
-      await pool.query(`
-        INSERT INTO fmos (id, quartel_id, bombeiro_id, data, justificativa)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          bombeiro_id = EXCLUDED.bombeiro_id,
-          data = EXCLUDED.data,
-          justificativa = EXCLUDED.justificativa
-      `, [newId, quartel_id, bombeiro_id, rawDate, justificativa]);
-      return res.json({ id: newId, quartel_id, bombeiro_id, data: rawDate, justificativa });
-    } catch (e) {
-      console.error("Erro ao salvar FMO:", e);
-      return res.status(500).json({ error: "Erro ao salvar FMO" });
-    }
+  const db = requireDb();
+  if (db) {
+    await runQuery("Erro ao salvar FMO.", () => db.query(`
+      INSERT INTO fmos (id, quartel_id, bombeiro_id, data, justificativa)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (id) DO UPDATE SET
+        quartel_id = EXCLUDED.quartel_id,
+        bombeiro_id = EXCLUDED.bombeiro_id,
+        data = EXCLUDED.data,
+        justificativa = EXCLUDED.justificativa
+    `, [newId, quartel_id, bombeiro_id, rawDate, justificativa]));
+    return res.json({ id: newId, quartel_id, bombeiro_id, data: rawDate, justificativa });
   }
 
   // Fallback Local Cache
@@ -750,101 +752,95 @@ app.post("/api/fmos", async (req, res) => {
     mockFmos.push(dataset);
   }
   res.json(dataset);
-});
+}));
 
-app.delete("/api/fmos/:id", async (req, res) => {
+app.delete("/api/fmos/:id", asyncHandler(async (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM fmos WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar FMO" });
-    }
+  const db = requireDb();
+  if (db) {
+    const result = await runQuery("Erro ao deletar FMO.", () =>
+      db.query("DELETE FROM fmos WHERE id = $1", [id]));
+    return res.json({ success: true, deleted: result.rowCount ?? 0 });
   }
+  const before = mockFmos.length;
   mockFmos = mockFmos.filter(fmo => fmo.id !== id);
-  res.json({ success: true });
-});
-
-
+  res.json({ success: true, deleted: before - mockFmos.length });
+}));
 
 // --- ADMINISTRAÇÃO E AUTENTICAÇÃO ---
-app.post("/api/admins/login", async (req, res) => {
+app.post("/api/admins/login", asyncHandler(async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
-    return res.status(400).json({ error: "Preencha usuário e senha." });
+    throw new HttpError(400, "Preencha usuário e senha.");
   }
 
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM administradores WHERE username = $1", [username.toLowerCase().trim()]);
-      if (result.rows.length > 0 && result.rows[0].password === password) {
-        const admin = result.rows[0];
-        return res.json({ success: true, admin: { username: admin.username, nome: admin.nome } });
-      }
-      return res.status(401).json({ error: "Credenciais de administrador incorretas." });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro interno no servidor." });
+  const db = requireDb();
+  if (db) {
+    const result = await runQuery("Erro ao validar credenciais de administrador.", () =>
+      db.query("SELECT * FROM administradores WHERE username = $1", [username.toLowerCase().trim()]));
+    if (result.rows.length > 0 && result.rows[0].password === password) {
+      const admin = result.rows[0];
+      return res.json({ success: true, admin: { username: admin.username, nome: admin.nome } });
     }
+    throw new HttpError(401, "Credenciais de administrador incorretas.");
   }
 
   const found = mockAdmins.find(a => a.username.toLowerCase().trim() === username.toLowerCase().trim() && a.password === password);
-  if (found) {
-    return res.json({ success: true, admin: { username: found.username, nome: found.nome } });
+  if (!found) {
+    throw new HttpError(401, "Credenciais de administrador incorretas.");
   }
-  return res.status(401).json({ error: "Credenciais de administrador incorretas." });
-});
+  res.json({ success: true, admin: { username: found.username, nome: found.nome } });
+}));
 
-app.post("/api/admins/register", async (req, res) => {
+app.post("/api/admins/register", asyncHandler(async (req, res) => {
   const { username, nome, password } = req.body;
   if (!username || !nome || !password) {
-    return res.status(400).json({ error: "Preencha usuário, nome e senha." });
+    throw new HttpError(400, "Preencha usuário, nome e senha.");
   }
 
   const cleanUser = username.toLowerCase().trim();
 
-  if (isDbConnected && pool) {
-    try {
-      const exists = await pool.query("SELECT * FROM administradores WHERE username = $1", [cleanUser]);
-      if (exists.rows.length > 0) {
-        return res.status(400).json({ error: "Nome de usuário administrador já cadastrado." });
-      }
-      await pool.query(`
-        INSERT INTO administradores (username, nome, password) 
-        VALUES ($1, $2, $3)
-      `, [cleanUser, nome, password]);
-      return res.json({ success: true, admin: { username: cleanUser, nome } });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao registrar administrador." });
+  const db = requireDb();
+  if (db) {
+    const exists = await runQuery("Erro ao consultar administradores.", () =>
+      db.query("SELECT * FROM administradores WHERE username = $1", [cleanUser]));
+    if (exists.rows.length > 0) {
+      throw new HttpError(400, "Nome de usuário administrador já cadastrado.");
     }
+    await runQuery("Erro ao registrar administrador.", () => db.query(`
+      INSERT INTO administradores (username, nome, password)
+      VALUES ($1, $2, $3)
+    `, [cleanUser, nome, password]));
+    return res.json({ success: true, admin: { username: cleanUser, nome } });
   }
 
   const exists = mockAdmins.find(a => a.username.toLowerCase().trim() === cleanUser);
   if (exists) {
-    return res.status(400).json({ error: "Nome de usuário administrador já cadastrado." });
+    throw new HttpError(400, "Nome de usuário administrador já cadastrado.");
   }
   mockAdmins.push({ username: cleanUser, nome, password });
   res.json({ success: true, admin: { username: cleanUser, nome } });
-});
+}));
 
-app.get("/api/admins", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT username, nome, criado_em FROM administradores ORDER BY nome");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
+app.get("/api/admins", asyncHandler(async (req, res) => {
+  const db = requireDb();
+  if (!db) {
+    return res.json(mockAdmins.map(a => ({ username: a.username, nome: a.nome, criado_em: new Date().toISOString() })));
   }
-  res.json(mockAdmins.map(a => ({ username: a.username, nome: a.nome, criado_em: new Date().toISOString() })));
-});
+  const result = await runQuery("Erro ao consultar administradores.", () =>
+    db.query("SELECT username, nome, criado_em FROM administradores ORDER BY nome"));
+  res.json(result.rows);
+}));
 
 
 // Configurar o Vite no Desenvolvimento
 async function run() {
+  // Rotas de API inexistentes precisam responder JSON antes do fallback SPA,
+  // que de outra forma devolveria o index.html com status 200.
+  app.use("/api", (req, res) => {
+    res.status(404).json({ error: `Rota de API não encontrada: ${req.method} ${req.originalUrl}` });
+  });
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -854,14 +850,46 @@ async function run() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+    app.get("*", (req, res, next) => {
+      res.sendFile(path.join(distPath, "index.html"), err => {
+        if (err) next(err);
+      });
     });
   }
+
+  // Handler central de erros: registra o erro completo e devolve status/mensagem úteis
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    const isMalformedJson = err instanceof SyntaxError && "body" in err;
+    const status = err instanceof HttpError ? err.status : (isMalformedJson ? 400 : 500);
+    console.error(`[API ${status}] ${req.method} ${req.originalUrl}:`, err);
+
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    const message = err instanceof HttpError
+      ? err.message
+      : (isMalformedJson ? "JSON inválido no corpo da requisição." : "Erro interno no servidor.");
+    const details = describeError(err);
+
+    res.status(status).json(details === message ? { error: message } : { error: message, details });
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Servidor de Gestão Firefighter rodando em http://0.0.0.0:${PORT}`);
   });
 }
 
-run();
+run().catch(err => {
+  console.error("Falha fatal ao iniciar o servidor:", err);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", reason => {
+  console.error("Rejeição de Promise não tratada:", reason);
+});
+
+process.on("uncaughtException", err => {
+  console.error("Exceção não capturada, encerrando o processo:", err);
+  process.exit(1);
+});

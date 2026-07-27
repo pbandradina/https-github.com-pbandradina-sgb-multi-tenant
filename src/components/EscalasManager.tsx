@@ -4,6 +4,7 @@ import {
   MapPin, CheckCircle, FileText, ChevronDown, Download 
 } from "lucide-react";
 import { Bombeiro, Escala, Quartel, Afastamento, Fmo } from "../types";
+import { describeError } from "../api";
 
 interface EscalasManagerProps {
   selectedQuartelId: string;
@@ -33,6 +34,7 @@ export default function EscalasManager({
   const [formFuncao, setFormFuncao] = useState("Auxiliar de Linha (Combate)");
   const [formPeriodo, setFormPeriodo] = useState("24h");
   const [isSubmitLoading, setIsSubmitLoading] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   // Filter for search or list
   const [filterDate, setFilterDate] = useState("");
@@ -101,6 +103,7 @@ export default function EscalasManager({
     }
 
     setIsSubmitLoading(true);
+    setSubmitError(null);
 
     try {
       await onAddEscala({
@@ -113,7 +116,8 @@ export default function EscalasManager({
       // Clear or reset select
       setFormBombeiroId("");
     } catch (err) {
-      console.error(err);
+      console.error("Erro ao lançar escala:", err);
+      setSubmitError(describeError(err));
     } finally {
       setIsSubmitLoading(false);
     }
@@ -248,6 +252,12 @@ export default function EscalasManager({
               >
                 <Plus className="w-4 h-4" /> Escalpar Integrante
               </button>
+
+              {submitError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 text-xs font-bold px-3 py-2 rounded-lg">
+                  {submitError}
+                </div>
+              )}
             </form>
             ) : (
               <div className="bg-amber-50 border border-amber-100 p-4 rounded-xl text-xs text-amber-800 font-semibold space-y-2 flex flex-col items-center">
