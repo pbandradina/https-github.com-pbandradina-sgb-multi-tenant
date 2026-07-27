@@ -11,22 +11,48 @@ import EfetivoManager from "./components/EfetivoManager";
 import FrequenciaManager from "./components/FrequenciaManager";
 import FmosDashboard from "./components/FmosDashboard";
 
+const TOKEN_KEY = "adminToken20gb";
+
 export default function App() {
   // Mobile navigation
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const [activeAdmin, setActiveAdmin] = useState<{ username: string; nome: string } | null>(null);
 
-  useEffect(() => {
-    const saved = localStorage.getItem("adminSession20gb");
-    if (saved) {
-      try {
-        setActiveAdmin(JSON.parse(saved));
-      } catch (e) {
-        console.error("Erro ao carregar sessão:", e);
-        localStorage.removeItem("adminSession20gb");
-      }
+  const clearAdminSession = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    setActiveAdmin(null);
+  };
+
+  // O token é sempre revalidado no servidor: a sessão local não concede permissões.
+  const apiFetch = async (url: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers);
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    if (init.body) headers.set("Content-Type", "application/json");
+
+    const response = await fetch(url, { ...init, headers });
+    if (response.status === 401) {
+      clearAdminSession();
+      setErrorBanner("Sessão administrativa expirada. Autentique-se novamente.");
     }
+    return response;
+  };
+
+  useEffect(() => {
+    if (!localStorage.getItem(TOKEN_KEY)) return;
+    fetch("/api/admins/session", {
+      headers: { Authorization: `Bearer ${localStorage.getItem(TOKEN_KEY)}` }
+    })
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (data?.admin) {
+          setActiveAdmin(data.admin);
+        } else {
+          clearAdminSession();
+        }
+      })
+      .catch(() => clearAdminSession());
   }, []);
 
   // Modals for Authentication
@@ -51,8 +77,7 @@ export default function App() {
   // Database Connection Status Information
   const [dbStatus, setDbStatus] = useState({
     connected: false,
-    database: "PostgreSQL",
-    connectionString: "Buscando..."
+    database: "PostgreSQL"
   });
 
   // Application State
@@ -135,9 +160,8 @@ export default function App() {
   // API operations callbacks
   const handleCreateMural = async (title: string, content: string, re: string) => {
     try {
-      const response = await fetch("/api/mural", {
+      const response = await apiFetch("/api/mural", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, content, authorRe: re, quartelId: selectedQuartelId })
       });
       if (response.ok) {
@@ -152,7 +176,7 @@ export default function App() {
 
   const handleDeleteMural = async (id: string) => {
     try {
-      const response = await fetch(`/api/mural/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/mural/${id}`, { method: "DELETE" });
       if (response.ok) {
         setMural(prev => prev.filter(m => m.id !== id));
       }
@@ -163,9 +187,8 @@ export default function App() {
 
   const handleUpdateViaturaStatus = async (id: string, status: string, escala_atual: string) => {
     try {
-      const response = await fetch(`/api/viaturas/${id}`, {
+      const response = await apiFetch(`/api/viaturas/${id}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status, escala_atual })
       });
       if (response.ok) {
@@ -182,9 +205,8 @@ export default function App() {
       // Automatic fleet deployment if viatura is selected
       let assignedVtrId = viaturaId || null;
 
-      const response = await fetch("/api/ocorrencias", {
+      const response = await apiFetch("/api/ocorrencias", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           quartel_id: selectedQuartelId,
           tipo,
@@ -215,9 +237,8 @@ export default function App() {
 
   const handleFecharOcorrencia = async (id: string, historico: string) => {
     try {
-      const response = await fetch(`/api/ocorrencias/${id}/fechar`, {
+      const response = await apiFetch(`/api/ocorrencias/${id}/fechar`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ historico })
       });
 
@@ -241,9 +262,8 @@ export default function App() {
 
   const handleAddBombeiro = async (data: Omit<Bombeiro, "id">) => {
     try {
-      const response = await fetch("/api/bombeiros", {
+      const response = await apiFetch("/api/bombeiros", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data)
       });
       if (response.ok) {
@@ -265,7 +285,7 @@ export default function App() {
   const handleDeleteBombeiro = async (id: string) => {
     if (!confirm("Deseja realmente remover este bombeiro do quadro geral?")) return;
     try {
-      const response = await fetch(`/api/bombeiros/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/bombeiros/${id}`, { method: "DELETE" });
       if (response.ok) {
         setBombeiros(prev => prev.filter(b => b.id !== id));
       }
@@ -277,9 +297,8 @@ export default function App() {
   const handleAddEscala = async (data: Omit<Escala, "id">) => {
     try {
       // 1. Register scale shift duty in DB
-      const response = await fetch("/api/escalas", {
+      const response = await apiFetch("/api/escalas", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data)
       });
 
@@ -315,7 +334,7 @@ export default function App() {
   const handleDeleteEscala = async (id: string) => {
     try {
       const escalaNode = escalas.find(e => e.id === id);
-      const response = await fetch(`/api/escalas/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/escalas/${id}`, { method: "DELETE" });
       if (response.ok) {
         setEscalas(prev => prev.filter(e => e.id !== id));
 
@@ -338,9 +357,8 @@ export default function App() {
 
   const handleAddAfastamento = async (data: Omit<Afastamento, "id">) => {
     try {
-      const response = await fetch("/api/afastamentos", {
+      const response = await apiFetch("/api/afastamentos", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data)
       });
       if (response.ok) {
@@ -356,7 +374,7 @@ export default function App() {
   const handleDeleteAfastamento = async (id: string) => {
     if (!confirm("Deseja realmente remover este afastamento?")) return;
     try {
-      const response = await fetch(`/api/afastamentos/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/afastamentos/${id}`, { method: "DELETE" });
       if (response.ok) {
         setAfastamentos(prev => prev.filter(a => a.id !== id));
       }
@@ -367,7 +385,7 @@ export default function App() {
 
   const handleSilentDeleteAfastamento = async (id: string) => {
     try {
-      const response = await fetch(`/api/afastamentos/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/afastamentos/${id}`, { method: "DELETE" });
       if (response.ok) {
         setAfastamentos(prev => prev.filter(a => a.id !== id));
       }
@@ -378,9 +396,8 @@ export default function App() {
 
   const handleAddFmo = async (data: Omit<Fmo, "id">) => {
     try {
-      const response = await fetch("/api/fmos", {
+      const response = await apiFetch("/api/fmos", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(data)
       });
       if (response.ok) {
@@ -396,7 +413,7 @@ export default function App() {
   const handleDeleteFmo = async (id: string) => {
     if (!confirm("Deseja realmente remover esta folga obrigatória (FMO)?")) return;
     try {
-      const response = await fetch(`/api/fmos/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/fmos/${id}`, { method: "DELETE" });
       if (response.ok) {
         setFmos(prev => prev.filter(f => f.id !== id));
       }
@@ -415,8 +432,8 @@ export default function App() {
         body: JSON.stringify({ username: loginUser, password: loginPass })
       });
       const data = await res.json();
-      if (res.ok && data.success) {
-        localStorage.setItem("adminSession20gb", JSON.stringify(data.admin));
+      if (res.ok && data.success && data.token) {
+        localStorage.setItem(TOKEN_KEY, data.token);
         setActiveAdmin(data.admin);
         setLoginModalOpen(false);
         setLoginUser("");
@@ -434,9 +451,8 @@ export default function App() {
     setRegError("");
     setRegSuccess("");
     try {
-      const res = await fetch("/api/admins/register", {
+      const res = await apiFetch("/api/admins/register", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: regUser, nome: regNome, password: regPass })
       });
       const data = await res.json();
@@ -453,9 +469,13 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("adminSession20gb");
-    setActiveAdmin(null);
+  const handleLogout = async () => {
+    try {
+      await apiFetch("/api/admins/logout", { method: "POST" });
+    } catch (err) {
+      console.error("Erro ao encerrar sessão:", err);
+    }
+    clearAdminSession();
   };
 
   const activeQuartelObj = quarteis.find(q => q.id === selectedQuartelId);
@@ -771,7 +791,7 @@ export default function App() {
               </div>
 
               <div className="text-[10px] text-zinc-500 leading-tight">
-                * Senha de fábrica inicial: <code className="bg-[#111113] px-1 py-0.5 text-zinc-300 rounded">sgb20gb</code>. Administradores podem registrar novos delegados após acessar.
+                * A senha inicial é definida pelo administrador do sistema (variável <code className="bg-[#111113] px-1 py-0.5 text-zinc-300 rounded">ADMIN_DEFAULT_PASSWORD</code>). Administradores podem registrar novos delegados após acessar.
               </div>
 
               <button 
