@@ -4,12 +4,12 @@ import App from './App.tsx';
 import './index.css';
 
 const rootElement = document.getElementById('root');
-if (rootElement) {
-  createRoot(rootElement).render(
-    <StrictMode>
-      <App />
-    </StrictMode>
-  );
-} else {
-  console.error("Failed to find the root element");
+if (!rootElement) {
+  throw new Error("Elemento raiz '#root' não encontrado: a aplicação não pode ser montada.");
 }
+
+createRoot(rootElement).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);

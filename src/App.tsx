@@ -10,6 +10,7 @@ import EscalasManager from "./components/EscalasManager";
 import EfetivoManager from "./components/EfetivoManager";
 import FrequenciaManager from "./components/FrequenciaManager";
 import FmosDashboard from "./components/FmosDashboard";
+import { apiRequest, describeError, postJson } from "./api";
 
 export default function App() {
   // Mobile navigation
@@ -49,7 +50,12 @@ export default function App() {
   const [selectedQuartelId, setSelectedQuartelId] = useState("q1");
 
   // Database Connection Status Information
-  const [dbStatus, setDbStatus] = useState({
+  const [dbStatus, setDbStatus] = useState<{
+    connected: boolean;
+    database: string;
+    connectionString: string;
+    error?: string | null;
+  }>({
     connected: false,
     database: "PostgreSQL",
     connectionString: "Buscando..."
@@ -91,15 +97,15 @@ export default function App() {
   const fetchAllData = async () => {
     try {
       const [resStatus, resQuarteis, resBombeiros, resEscalas, resViaturas, resOcorrencias, resMural, resAfastamentos, resFmos] = await Promise.all([
-        fetch("/api/status").then(r => r.json()),
-        fetch("/api/quarteis").then(r => r.json()),
-        fetch("/api/bombeiros").then(r => r.json()),
-        fetch("/api/escalas").then(r => r.json()),
-        fetch("/api/viaturas").then(r => r.json()),
-        fetch("/api/ocorrencias").then(r => r.json()),
-        fetch("/api/mural").then(r => r.json()),
-        fetch("/api/afastamentos").then(r => r.json()),
-        fetch("/api/fmos").then(r => r.json())
+        apiRequest<{ connected: boolean; database: string; connectionString: string; error?: string | null }>("/api/status"),
+        apiRequest<Quartel[]>("/api/quarteis"),
+        apiRequest<Bombeiro[]>("/api/bombeiros"),
+        apiRequest<Escala[]>("/api/escalas"),
+        apiRequest<Viatura[]>("/api/viaturas"),
+        apiRequest<Ocorrencia[]>("/api/ocorrencias"),
+        apiRequest<MuralPost[]>("/api/mural"),
+        apiRequest<Afastamento[]>("/api/afastamentos"),
+        apiRequest<Fmo[]>("/api/fmos")
       ]);
 
       setDbStatus(resStatus);
@@ -111,12 +117,16 @@ export default function App() {
       setMural(resMural);
       setAfastamentos(resAfastamentos);
       setFmos(resFmos);
-      
-      // Clear errors
-      setErrorBanner(null);
+
+      // A degradação para persistência em memória precisa ser visível ao operador
+      setErrorBanner(
+        !resStatus.connected && resStatus.error
+          ? `Banco de dados indisponível, operando somente em memória: ${resStatus.error}`
+          : null
+      );
     } catch (err) {
       console.error("Erro ao sincronizar dados do servidor:", err);
-      setErrorBanner("Falha na sincronização operacional em tempo real. Reconectando...");
+      setErrorBanner(`Falha na sincronização operacional em tempo real: ${describeError(err)}`);
     }
   };
 
@@ -133,47 +143,47 @@ export default function App() {
   }, []);
 
   // API operations callbacks
+  // Registra o erro, informa o operador e repropaga para que o componente
+  // chamador não trate a operação falhada como concluída.
+  const reportError = (context: string, err: unknown): never => {
+    console.error(context, err);
+    setErrorBanner(`${context}: ${describeError(err)}`);
+    throw err instanceof Error ? err : new Error(describeError(err));
+  };
+
   const handleCreateMural = async (title: string, content: string, re: string) => {
     try {
-      const response = await fetch("/api/mural", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, content, authorRe: re, quartelId: selectedQuartelId })
+      const newPost = await postJson<MuralPost>("/api/mural", {
+        title,
+        content,
+        authorRe: re,
+        quartelId: selectedQuartelId
       });
-      if (response.ok) {
-        const newPost = await response.json();
-        setMural(prev => [newPost, ...prev]);
-      }
+      setMural(prev => [newPost, ...prev]);
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao fixar aviso operacional.");
+      reportError("Erro ao fixar aviso operacional", e);
     }
   };
 
   const handleDeleteMural = async (id: string) => {
     try {
-      const response = await fetch(`/api/mural/${id}`, { method: "DELETE" });
-      if (response.ok) {
-        setMural(prev => prev.filter(m => m.id !== id));
-      }
+      await apiRequest(`/api/mural/${id}`, { method: "DELETE" });
+      setMural(prev => prev.filter(m => m.id !== id));
     } catch (e) {
-      console.error(e);
+      reportError("Erro ao remover aviso do mural", e);
     }
   };
 
   const handleUpdateViaturaStatus = async (id: string, status: string, escala_atual: string) => {
     try {
-      const response = await fetch(`/api/viaturas/${id}`, {
+      const updated = await apiRequest<Viatura>(`/api/viaturas/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status, escala_atual })
       });
-      if (response.ok) {
-        const updated = await response.json();
-        setViaturas(prev => prev.map(v => v.id === id ? updated : v));
-      }
+      setViaturas(prev => prev.map(v => v.id === id ? updated : v));
     } catch (e) {
-      console.error(e);
+      reportError("Erro ao atualizar situação da viatura", e);
     }
   };
 
@@ -182,226 +192,164 @@ export default function App() {
       // Automatic fleet deployment if viatura is selected
       let assignedVtrId = viaturaId || null;
 
-      const response = await fetch("/api/ocorrencias", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          quartel_id: selectedQuartelId,
-          tipo,
-          endereco,
-          viatura_id: assignedVtrId,
-          status: "Ativa",
-          historico: `Viatura despachada em emergência imediata às ${new Date().toLocaleTimeString("pt-BR")}.`
-        })
+      const newOco = await postJson<Ocorrencia>("/api/ocorrencias", {
+        quartel_id: selectedQuartelId,
+        tipo,
+        endereco,
+        viatura_id: assignedVtrId,
+        status: "Ativa",
+        historico: `Viatura despachada em emergência imediata às ${new Date().toLocaleTimeString("pt-BR")}.`
       });
+      setOcorrencias(prev => [newOco, ...prev]);
 
-      if (response.ok) {
-        const newOco = await response.json();
-        setOcorrencias(prev => [newOco, ...prev]);
-
-        // If a vehicle was deployed, automatically set its state to 'Em Ocorrência' in our DB!
-        if (assignedVtrId) {
-          const vtr = viaturas.find(v => v.id === assignedVtrId);
-          if (vtr) {
-            await handleUpdateViaturaStatus(assignedVtrId, "Em Ocorrência", vtr.escala_atual);
-          }
+      // If a vehicle was deployed, automatically set its state to 'Em Ocorrência' in our DB!
+      if (assignedVtrId) {
+        const vtr = viaturas.find(v => v.id === assignedVtrId);
+        if (vtr) {
+          await handleUpdateViaturaStatus(assignedVtrId, "Em Ocorrência", vtr.escala_atual);
         }
       }
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao realizar o despacho emergencial.");
+      reportError("Erro ao realizar o despacho emergencial", e);
     }
   };
 
   const handleFecharOcorrencia = async (id: string, historico: string) => {
     try {
-      const response = await fetch(`/api/ocorrencias/${id}/fechar`, {
+      const closedOco = await apiRequest<Ocorrencia>(`/api/ocorrencias/${id}/fechar`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ historico })
       });
+      setOcorrencias(prev => prev.map(o => o.id === id ? closedOco : o));
 
-      if (response.ok) {
-        const closedOco = await response.json();
-        setOcorrencias(prev => prev.map(o => o.id === id ? closedOco : o));
-
-        // If the occurrence has a vehicle assigned, free up the vehicle dynamically to 'Pronta para Serviço'!
-        if (closedOco.viatura_id) {
-          const vtr = viaturas.find(v => v.id === closedOco.viatura_id);
-          if (vtr) {
-            await handleUpdateViaturaStatus(closedOco.viatura_id, "Pronta para Serviço", vtr.escala_atual);
-          }
+      // If the occurrence has a vehicle assigned, free up the vehicle dynamically to 'Pronta para Serviço'!
+      if (closedOco.viatura_id) {
+        const vtr = viaturas.find(v => v.id === closedOco.viatura_id);
+        if (vtr) {
+          await handleUpdateViaturaStatus(closedOco.viatura_id, "Pronta para Serviço", vtr.escala_atual);
         }
       }
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao concluir ocorrência operante.");
+      reportError("Erro ao concluir ocorrência operante", e);
     }
   };
 
   const handleAddBombeiro = async (data: Omit<Bombeiro, "id">) => {
     try {
-      const response = await fetch("/api/bombeiros", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
+      const newBombeiro = await postJson<Bombeiro>("/api/bombeiros", data);
+      setBombeiros(prev => {
+        const exists = prev.some(b => b.id === newBombeiro.id);
+        if (exists) {
+          return prev.map(b => b.id === newBombeiro.id ? newBombeiro : b);
+        }
+        return [...prev, newBombeiro];
       });
-      if (response.ok) {
-        const newBombeiro = await response.json();
-        setBombeiros(prev => {
-          const exists = prev.some(b => b.id === newBombeiro.id);
-          if (exists) {
-            return prev.map(b => b.id === newBombeiro.id ? newBombeiro : b);
-          }
-          return [...prev, newBombeiro];
-        });
-      }
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao registrar bombeiro militar.");
+      reportError("Erro ao registrar bombeiro militar", e);
     }
   };
 
   const handleDeleteBombeiro = async (id: string) => {
     if (!confirm("Deseja realmente remover este bombeiro do quadro geral?")) return;
     try {
-      const response = await fetch(`/api/bombeiros/${id}`, { method: "DELETE" });
-      if (response.ok) {
-        setBombeiros(prev => prev.filter(b => b.id !== id));
-      }
+      await apiRequest(`/api/bombeiros/${id}`, { method: "DELETE" });
+      setBombeiros(prev => prev.filter(b => b.id !== id));
     } catch (e) {
-      console.error(e);
+      reportError("Erro ao remover bombeiro do quadro", e);
     }
   };
 
   const handleAddEscala = async (data: Omit<Escala, "id">) => {
     try {
       // 1. Register scale shift duty in DB
-      const response = await fetch("/api/escalas", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
-      });
+      const newEscala = await postJson<Escala>("/api/escalas", data);
+      setEscalas(prev => [...prev, newEscala]);
 
-      if (response.ok) {
-        const newEscala = await response.json();
-        setEscalas(prev => [...prev, newEscala]);
+      // 2. Intelligent Auto-Tripulação of Viaturas!
+      // If they chose a role connected to a vehicle (e.g. "Motorista ABS", "Socorrista UR", "Membro ABS"),
+      // let's automatically attach them to that vehicle's live crew list!
+      let targetVtrCode = "";
+      if (data.funcao.includes("(ABS")) targetVtrCode = "ABS-201";
+      if (data.funcao.includes("(UR")) targetVtrCode = "UR-205";
+      if (data.funcao.includes("(AEM")) targetVtrCode = "AEM-202";
 
-        // 2. Intelligent Auto-Tripulação of Viaturas!
-        // If they chose a role connected to a vehicle (e.g. "Motorista ABS", "Socorrista UR", "Membro ABS"),
-        // let's automatically attach them to that vehicle's live crew list!
-        let targetVtrCode = "";
-        if (data.funcao.includes("(ABS")) targetVtrCode = "ABS-201";
-        if (data.funcao.includes("(UR")) targetVtrCode = "UR-205";
-        if (data.funcao.includes("(AEM")) targetVtrCode = "AEM-202";
-
-        if (targetVtrCode) {
-          const targetVtr = viaturas.find(v => v.codigo === targetVtrCode && v.quartel_id === selectedQuartelId);
-          if (targetVtr) {
-            const currentStaff = targetVtr.escala_atual ? targetVtr.escala_atual.split(",").filter(Boolean) : [];
-            if (!currentStaff.includes(data.bombeiro_id)) {
-              currentStaff.push(data.bombeiro_id);
-              await handleUpdateViaturaStatus(targetVtr.id, targetVtr.status, currentStaff.join(","));
-            }
+      if (targetVtrCode) {
+        const targetVtr = viaturas.find(v => v.codigo === targetVtrCode && v.quartel_id === selectedQuartelId);
+        if (targetVtr) {
+          const currentStaff = targetVtr.escala_atual ? targetVtr.escala_atual.split(",").filter(Boolean) : [];
+          if (!currentStaff.includes(data.bombeiro_id)) {
+            currentStaff.push(data.bombeiro_id);
+            await handleUpdateViaturaStatus(targetVtr.id, targetVtr.status, currentStaff.join(","));
           }
         }
       }
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao lançar escala laboral.");
+      reportError("Erro ao lançar escala de serviço", e);
     }
   };
 
   const handleDeleteEscala = async (id: string) => {
     try {
       const escalaNode = escalas.find(e => e.id === id);
-      const response = await fetch(`/api/escalas/${id}`, { method: "DELETE" });
-      if (response.ok) {
-        setEscalas(prev => prev.filter(e => e.id !== id));
+      await apiRequest(`/api/escalas/${id}`, { method: "DELETE" });
+      setEscalas(prev => prev.filter(e => e.id !== id));
 
-        // Let's untrip the firefighter from vehicles crew automatically!
-        if (escalaNode) {
-          const vtrsToScrub = viaturas.filter(v => v.quartel_id === selectedQuartelId);
-          for (const vt of vtrsToScrub) {
-            let crewArr = vt.escala_atual ? vt.escala_atual.split(",").filter(Boolean) : [];
-            if (crewArr.includes(escalaNode.bombeiro_id)) {
-              crewArr = crewArr.filter(cid => cid !== escalaNode.bombeiro_id);
-              await handleUpdateViaturaStatus(vt.id, vt.status, crewArr.join(","));
-            }
+      // Let's untrip the firefighter from vehicles crew automatically!
+      if (escalaNode) {
+        const vtrsToScrub = viaturas.filter(v => v.quartel_id === selectedQuartelId);
+        for (const vt of vtrsToScrub) {
+          let crewArr = vt.escala_atual ? vt.escala_atual.split(",").filter(Boolean) : [];
+          if (crewArr.includes(escalaNode.bombeiro_id)) {
+            crewArr = crewArr.filter(cid => cid !== escalaNode.bombeiro_id);
+            await handleUpdateViaturaStatus(vt.id, vt.status, crewArr.join(","));
           }
         }
       }
     } catch (e) {
-      console.error(e);
+      reportError("Erro ao remover escala de serviço", e);
     }
   };
 
   const handleAddAfastamento = async (data: Omit<Afastamento, "id">) => {
     try {
-      const response = await fetch("/api/afastamentos", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
-      });
-      if (response.ok) {
-        const newAf = await response.json();
-        setAfastamentos(prev => [...prev.filter(a => a.id !== newAf.id), newAf]);
-      }
+      const newAf = await postJson<Afastamento>("/api/afastamentos", data);
+      setAfastamentos(prev => [...prev.filter(a => a.id !== newAf.id), newAf]);
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao registrar afastamento do militar.");
+      reportError("Erro ao registrar afastamento do militar", e);
     }
   };
 
   const handleDeleteAfastamento = async (id: string) => {
     if (!confirm("Deseja realmente remover este afastamento?")) return;
-    try {
-      const response = await fetch(`/api/afastamentos/${id}`, { method: "DELETE" });
-      if (response.ok) {
-        setAfastamentos(prev => prev.filter(a => a.id !== id));
-      }
-    } catch (e) {
-      console.error(e);
-    }
+    await handleSilentDeleteAfastamento(id);
   };
 
   const handleSilentDeleteAfastamento = async (id: string) => {
     try {
-      const response = await fetch(`/api/afastamentos/${id}`, { method: "DELETE" });
-      if (response.ok) {
-        setAfastamentos(prev => prev.filter(a => a.id !== id));
-      }
+      await apiRequest(`/api/afastamentos/${id}`, { method: "DELETE" });
+      setAfastamentos(prev => prev.filter(a => a.id !== id));
     } catch (e) {
-      console.error(e);
+      reportError("Erro ao remover afastamento", e);
     }
   };
 
   const handleAddFmo = async (data: Omit<Fmo, "id">) => {
     try {
-      const response = await fetch("/api/fmos", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
-      });
-      if (response.ok) {
-        const newFmo = await response.json();
-        setFmos(prev => [...prev.filter(f => f.id !== newFmo.id), newFmo]);
-      }
+      const newFmo = await postJson<Fmo>("/api/fmos", data);
+      setFmos(prev => [...prev.filter(f => f.id !== newFmo.id), newFmo]);
     } catch (e) {
-      console.error(e);
-      setErrorBanner("Erro ao registrar Folga Mensal Obrigatória (FMO).");
+      reportError("Erro ao registrar Folga Mensal Obrigatória (FMO)", e);
     }
   };
 
   const handleDeleteFmo = async (id: string) => {
     if (!confirm("Deseja realmente remover esta folga obrigatória (FMO)?")) return;
     try {
-      const response = await fetch(`/api/fmos/${id}`, { method: "DELETE" });
-      if (response.ok) {
-        setFmos(prev => prev.filter(f => f.id !== id));
-      }
+      await apiRequest(`/api/fmos/${id}`, { method: "DELETE" });
+      setFmos(prev => prev.filter(f => f.id !== id));
     } catch (e) {
-      console.error(e);
+      reportError("Erro ao remover folga obrigatória (FMO)", e);
     }
   };
 
@@ -409,23 +357,18 @@ export default function App() {
     e.preventDefault();
     setLoginError("");
     try {
-      const res = await fetch("/api/admins/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: loginUser, password: loginPass })
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        localStorage.setItem("adminSession20gb", JSON.stringify(data.admin));
-        setActiveAdmin(data.admin);
-        setLoginModalOpen(false);
-        setLoginUser("");
-        setLoginPass("");
-      } else {
-        setLoginError(data.error || "Credenciais de administrador incorretas.");
-      }
+      const data = await postJson<{ success: boolean; admin: { username: string; nome: string } }>(
+        "/api/admins/login",
+        { username: loginUser, password: loginPass }
+      );
+      localStorage.setItem("adminSession20gb", JSON.stringify(data.admin));
+      setActiveAdmin(data.admin);
+      setLoginModalOpen(false);
+      setLoginUser("");
+      setLoginPass("");
     } catch (err) {
-      setLoginError("Erro ao conectar com o servidor.");
+      console.error("Erro ao autenticar administrador:", err);
+      setLoginError(describeError(err));
     }
   };
 
@@ -434,22 +377,18 @@ export default function App() {
     setRegError("");
     setRegSuccess("");
     try {
-      const res = await fetch("/api/admins/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: regUser, nome: regNome, password: regPass })
+      await postJson<{ success: boolean }>("/api/admins/register", {
+        username: regUser,
+        nome: regNome,
+        password: regPass
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setRegSuccess(`Administrador "${regUser}" cadastrado com sucesso!`);
-        setRegUser("");
-        setRegNome("");
-        setRegPass("");
-      } else {
-        setRegError(data.error || "Erro ao registrar administrador.");
-      }
+      setRegSuccess(`Administrador "${regUser}" cadastrado com sucesso!`);
+      setRegUser("");
+      setRegNome("");
+      setRegPass("");
     } catch (err) {
-      setRegError("Erro ao conectar com o servidor.");
+      console.error("Erro ao registrar administrador:", err);
+      setRegError(describeError(err));
     }
   };
 

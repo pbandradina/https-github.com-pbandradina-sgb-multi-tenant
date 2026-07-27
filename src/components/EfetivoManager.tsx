@@ -4,6 +4,7 @@ import {
   MapPin, Check, UserPlus, X, Shield, Star 
 } from "lucide-react";
 import { Bombeiro, Quartel } from "../types";
+import { describeError } from "../api";
 
 interface EfetivoManagerProps {
   selectedQuartelId: string;
@@ -39,6 +40,7 @@ export default function EfetivoManager({
   const [formRegime, setFormRegime] = useState("PRONTIDÃO");
   const [formEquipe, setFormEquipe] = useState("VERDE");
   const [isSubmitLoading, setIsSubmitLoading] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
 
   // Brazilian fire station ranks
@@ -75,7 +77,11 @@ export default function EfetivoManager({
 
   const handleAddBombeiro = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formNome || !formNomeGuerra || !formRe) return;
+    setSubmitError(null);
+    if (!formNome || !formNomeGuerra || !formRe) {
+      setSubmitError("Preencha nome completo, nome de guerra e RE.");
+      return;
+    }
     setIsSubmitLoading(true);
 
     try {
@@ -106,7 +112,8 @@ export default function EfetivoManager({
       setFormEquipe("VERDE");
       setShowAddForm(false);
     } catch (err) {
-      console.error(err);
+      console.error("Erro ao cadastrar bombeiro:", err);
+      setSubmitError(describeError(err));
     } finally {
       setIsSubmitLoading(false);
     }
@@ -291,6 +298,12 @@ export default function EfetivoManager({
               </button>
             </div>
           </form>
+
+          {submitError && (
+            <div className="mt-4 bg-red-50 border border-red-200 text-red-700 text-xs font-bold px-3 py-2 rounded-lg">
+              {submitError}
+            </div>
+          )}
         </div>
       )}
 

@@ -6,6 +6,7 @@ import {
   ChevronLeft, ChevronRight
 } from "lucide-react";
 import { Bombeiro, Escala, Quartel, Afastamento, Fmo } from "../types";
+import { describeError } from "../api";
 
 interface FrequenciaManagerProps {
   selectedQuartelId: string;
@@ -355,8 +356,9 @@ export default function FrequenciaManager({
       setAfInicio("");
       setAfFim("");
       setAfJustificativa("");
-    } catch {
-      setAfFormError("Ocorreu uma falha ao persistir afastamento.");
+    } catch (err) {
+      console.error("Erro ao persistir afastamento:", err);
+      setAfFormError(`Falha ao persistir afastamento: ${describeError(err)}`);
     }
   };
 
@@ -403,8 +405,9 @@ export default function FrequenciaManager({
       setFmoFormSuccess(true);
       setFmoData("");
       setFmoJustificativa("");
-    } catch {
-      setFmoFormError("Erro de comunicação com o banco ao registrar FMO.");
+    } catch (err) {
+      console.error("Erro ao registrar FMO:", err);
+      setFmoFormError(`Falha ao registrar FMO: ${describeError(err)}`);
     }
   };
 
@@ -505,31 +508,37 @@ export default function FrequenciaManager({
       setModalAfFim("");
       setModalAfJustificativa("");
       setModalError(null);
-    } catch (err: any) {
-      console.error(err);
-      setModalError("Erro ao registrar no banco.");
+    } catch (err) {
+      console.error("Erro ao registrar lançamento do quadro:", err);
+      setModalError(`Erro ao registrar no banco: ${describeError(err)}`);
     } finally {
       setModalLoading(false);
     }
   };
 
+  // Exibe a falha no próprio modal em vez de deixá-la como rejeição não tratada
+  const runModalDeletion = async (confirmation: string, remove: () => Promise<void>) => {
+    if (!confirm(confirmation)) return;
+    setModalError(null);
+    try {
+      await remove();
+    } catch (err) {
+      console.error("Erro ao remover lançamento do quadro:", err);
+      setModalError(`Erro ao remover registro: ${describeError(err)}`);
+    }
+  };
+
   const handleModalDeleteEscala = async (id: string) => {
     if (!onDeleteEscala) return;
-    if (confirm("Remover esta escala operacional do militar?")) {
-      await onDeleteEscala(id);
-    }
+    await runModalDeletion("Remover esta escala operacional do militar?", () => onDeleteEscala(id));
   };
 
   const handleModalDeleteFmo = async (id: string) => {
-    if (confirm("Remover esta folga obrigatória FMO?")) {
-      await onDeleteFmo(id);
-    }
+    await runModalDeletion("Remover esta folga obrigatória FMO?", () => onDeleteFmo(id));
   };
 
   const handleModalDeleteAfastamento = async (id: string) => {
-    if (confirm("Remover este termo de afastamento?")) {
-      await onDeleteAfastamento(id);
-    }
+    await runModalDeletion("Remover este termo de afastamento?", () => onDeleteAfastamento(id));
   };
 
   const handlePrintFrequencia = () => {
