@@ -6,6 +6,30 @@ import {
   ChevronLeft, ChevronRight
 } from "lucide-react";
 import { Bombeiro, Escala, Quartel, Afastamento, Fmo } from "../types";
+import {
+  MESES_OPTIONS,
+  buildDateKey,
+  formatDateBR,
+  getDaysInMonth,
+  getFirstWeekdayOfMonth,
+  isDateKeyInMonth,
+  isDateKeyInRange
+} from "../lib/dates";
+import { LIMITE_HORAS_MES, PERIODOS_ESCALA, horasDoPeriodo, periodoAbrev } from "../lib/escalas";
+import { EquipeProntidao, getProntidaoDoDiaKey } from "../lib/prontidao";
+import {
+  contarDiasAfastados,
+  filterAfastamentosDoMes,
+  filterFmosDoMes,
+  findAfastamentoNaData,
+  findFmoNaData
+} from "../lib/frequencia";
+
+const ESTILOS_PRONTIDAO: Record<EquipeProntidao, { text: string; bg: string; border: string }> = {
+  VERDE: { text: "text-emerald-400 bg-emerald-500/10 border-emerald-500/35", bg: "bg-emerald-600", border: "border-emerald-500" },
+  AMARELA: { text: "text-amber-400 bg-amber-500/10 border-amber-500/35", bg: "bg-yellow-500", border: "border-yellow-500" },
+  AZUL: { text: "text-blue-400 bg-blue-500/10 border-blue-500/30", bg: "bg-blue-600", border: "border-blue-500" }
+};
 
 interface FrequenciaManagerProps {
   selectedQuartelId: string;
@@ -91,40 +115,15 @@ export default function FrequenciaManager({
   const stationFmos = fmos.filter(f => f.quartel_id === selectedQuartelId);
 
   // Month options
-  const meses = [
-    { value: 1, label: "Janeiro" },
-    { value: 2, label: "Fevereiro" },
-    { value: 3, label: "Março" },
-    { value: 4, label: "Abril" },
-    { value: 5, label: "Maio" },
-    { value: 6, label: "Junho" },
-    { value: 7, label: "Julho" },
-    { value: 8, label: "Agosto" },
-    { value: 9, label: "Setembro" },
-    { value: 10, label: "Outubro" },
-    { value: 11, label: "Novembro" },
-    { value: 12, label: "Dezembro" }
-  ];
+  const meses = MESES_OPTIONS;
 
   // Check if a date string falls inside an absence period for a firefighter
-  const checkIfMilitarAfastadoOnDate = (militarId: string, dateStr: string) => {
-    const targetDate = new Date(dateStr + "T00:00:00");
-    const mAbsences = stationAfastamentos.filter(a => a.bombeiro_id === militarId);
-    
-    for (const ab of mAbsences) {
-      const dStart = new Date(ab.data_inicio + "T00:00:00");
-      const dEnd = new Date(ab.data_fim + "T00:00:00");
-      if (targetDate >= dStart && targetDate <= dEnd) {
-        return ab;
-      }
-    }
-    return null;
-  };
+  const checkIfMilitarAfastadoOnDate = (militarId: string, dateStr: string) =>
+    findAfastamentoNaData(stationAfastamentos, militarId, dateStr);
 
   // Check if a militar has a programmed FMO on a specific date
-  const checkIfMilitarHasFmoOnDate = (militarId: string, dateStr: string) => {
-    return stationFmos.find(f => f.bombeiro_id === militarId && f.data === dateStr);
-  };
+  const checkIfMilitarHasFmoOnDate = (militarId: string, dateStr: string) =>
+    findFmoNaData(stationFmos, militarId, dateStr);
 
   // Relação de conflitos pré-existentes na base para segurança operacional
   const activeConflicts: Array<{ militar: string; data: string; descricao: string; tipo: "afastamento" | "fmo" }> = [];
@@ -159,31 +158,15 @@ export default function FrequenciaManager({
   // Compiled Statistics per firefighter with full respect to schedules, FMO, and leave days
   const folhaFrequencia = activeBombeiros.filter(b => (b.regime || "PRONTIDÃO") !== "EXPEDIENTE").map((bombeiro) => {
     // Find actual attendances scale shifts this month
-    const plantoesMes = stationEscalas.filter(escala => {
-      if (escala.bombeiro_id !== bombeiro.id) return false;
-      const dataEscala = new Date(escala.data + "T00:00:00");
-      return (dataEscala.getMonth() + 1) === selectedMonth && dataEscala.getFullYear() === selectedYear;
-    });
+    const plantoesMes = stationEscalas.filter(
+      escala => escala.bombeiro_id === bombeiro.id && isDateKeyInMonth(escala.data, selectedMonth, selectedYear)
+    );
 
     // Absences that fall in this month
-    const afastamentosNoMes = stationAfastamentos.filter(ab => {
-      if (ab.bombeiro_id !== bombeiro.id) return false;
-      const dStart = new Date(ab.data_inicio + "T00:00:00");
-      const dEnd = new Date(ab.data_fim + "T00:00:00");
-      
-      // Check if overlapping selected month/year
-      const startMonthLimit = new Date(selectedYear, selectedMonth - 1, 1);
-      const endMonthLimit = new Date(selectedYear, selectedMonth, 0);
-
-      return (dStart <= endMonthLimit && dEnd >= startMonthLimit);
-    });
+    const afastamentosNoMes = filterAfastamentosDoMes(stationAfastamentos, bombeiro.id, selectedMonth, selectedYear);
 
     // FMOs generated in this month
-    const fmosNoMes = stationFmos.filter(f => {
-      if (f.bombeiro_id !== bombeiro.id) return false;
-      const dFmo = new Date(f.data + "T00:00:00");
-      return (dFmo.getMonth() + 1) === selectedMonth && dFmo.getFullYear() === selectedYear;
-    });
+    const fmosNoMes = filterFmosDoMes(stationFmos, bombeiro.id, selectedMonth, selectedYear);
 
     // Compute active hours of operational duty
     let horasTrabalhadas = 0;
@@ -196,30 +179,16 @@ export default function FrequenciaManager({
       if (absInDay) return; // Skip work count since he was absent/on leave
 
       plantoesContagem++;
-      if (p.periodo === "24h") {
-        horasTrabalhadas += 24;
-        horasNoturnas += 7;
-      } else if (p.periodo === "Noturno 12h") {
-        horasTrabalhadas += 12;
-        horasNoturnas += 7;
-      } else if (p.periodo === "Diurno 12h") {
-        horasTrabalhadas += 12;
-      } else {
-        horasTrabalhadas += 12;
-      }
+      const { horas, horasNoturnas: noturnas } = horasDoPeriodo(p.periodo);
+      horasTrabalhadas += horas;
+      horasNoturnas += noturnas;
     });
 
-    // Extra hours above 160h standard month duty
-    const limiteHorasMes = 160;
-    const horasExcedentes = Math.max(0, horasTrabalhadas - limiteHorasMes);
+    // Extra hours above the standard month duty limit
+    const horasExcedentes = Math.max(0, horasTrabalhadas - LIMITE_HORAS_MES);
 
     // Deduções de Afastamento
-    const diasAfastadosMesValue = afastamentosNoMes.reduce((acc, current) => {
-      const dS = new Date(current.data_inicio + "T00:00:00");
-      const dE = new Date(current.data_fim + "T00:00:00");
-      const diffTime = Math.abs(dE.getTime() - dS.getTime());
-      return acc + Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-    }, 0);
+    const diasAfastadosMesValue = contarDiasAfastados(afastamentosNoMes);
 
     return {
       bombeiro,
@@ -250,27 +219,10 @@ export default function FrequenciaManager({
   const totalFmosGerais = folhaFrequencia.reduce((sum, item) => sum + item.fmosNoMes.length, 0);
   const totalDiasAfastadosGerais = folhaFrequencia.reduce((sum, item) => sum + item.diasAfastados, 0);
 
-  // Interactive calendar calculations
-  const getDaysInMonth = (month: number, year: number) => {
-    return new Date(year, month, 0).getDate();
-  };
-  const getFirstDayOfMonth = (month: number, year: number) => {
-    return new Date(year, month - 1, 1).getDay(); // 0 = Dom, 1 = Seg ...
-  };
-
   const getProntidaoDoDiaStr = (dateStr: string) => {
     if (!dateStr) return { name: "", text: "border-transparent text-slate-500", bg: "", border: "" };
-    const d = new Date(dateStr + "T12:00:00");
-    const reference = new Date(2026, 0, 1).getTime();
-    const target = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-    const diffDays = Math.round((target - reference) / (1000 * 60 * 60 * 24));
-    const idx = ((diffDays % 3) + 3) % 3;
-    const choices = [
-      { name: "VERDE", text: "text-emerald-400 bg-emerald-500/10 border-emerald-500/35", bg: "bg-emerald-600", border: "border-emerald-500" },
-      { name: "AMARELA", text: "text-amber-400 bg-amber-500/10 border-amber-500/35", bg: "bg-yellow-500", border: "border-yellow-500" },
-      { name: "AZUL", text: "text-blue-400 bg-blue-500/10 border-blue-500/30", bg: "bg-blue-600", border: "border-blue-500" }
-    ];
-    return choices[idx];
+    const equipe = getProntidaoDoDiaKey(dateStr);
+    return { name: equipe, ...ESTILOS_PRONTIDAO[equipe] };
   };
 
   const handlePrevMonth = () => {
@@ -292,7 +244,7 @@ export default function FrequenciaManager({
   };
 
   const daysInMonth = getDaysInMonth(selectedMonth, selectedYear);
-  const startDayOfWeek = getFirstDayOfMonth(selectedMonth, selectedYear);
+  const startDayOfWeek = getFirstWeekdayOfMonth(selectedMonth, selectedYear);
 
   const daysGrid: Array<{ dateStr: string; dayNum: number | null }> = [];
   // Dummy empty spaces
@@ -301,8 +253,7 @@ export default function FrequenciaManager({
   }
   // Days of month
   for (let d = 1; d <= daysInMonth; d++) {
-    const dStr = `${selectedYear}-${String(selectedMonth).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
-    daysGrid.push({ dateStr: dStr, dayNum: d });
+    daysGrid.push({ dateStr: buildDateKey(selectedYear, selectedMonth, d), dayNum: d });
   }
 
   // Handle addition of Afastamento
@@ -316,21 +267,16 @@ export default function FrequenciaManager({
       return;
     }
 
-    const dS = new Date(afInicio + "T00:00:00");
-    const dE = new Date(afFim + "T00:00:00");
-
-    if (dE < dS) {
+    if (afFim < afInicio) {
       setAfFormError("A data de término do afastamento não pode ser anterior à data de início.");
       return;
     }
 
     // Safety checks for pre-existing scheduled duty scales in specified period
     const mil = activeBombeiros.find(b => b.id === afMilitarId);
-    const scaleCollisions = stationEscalas.filter(esc => {
-      if (esc.bombeiro_id !== afMilitarId) return false;
-      const dEsc = new Date(esc.data + "T00:00:00");
-      return (dEsc >= dS && dEsc <= dE);
-    });
+    const scaleCollisions = stationEscalas.filter(
+      esc => esc.bombeiro_id === afMilitarId && isDateKeyInRange(esc.data, afInicio, afFim)
+    );
 
     let autoJust = afJustificativa;
     if (scaleCollisions.length > 0) {
@@ -374,7 +320,7 @@ export default function FrequenciaManager({
     const mil = activeBombeiros.find(b => b.id === fmoMilitarId);
     if (mil && mil.data_inicio_servico) {
       if (fmoData < mil.data_inicio_servico) {
-        const formattedDate = new Date(mil.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
+        const formattedDate = formatDateBR(mil.data_inicio_servico);
         setFmoFormError(`Impossível homologar FMO neste dia: o militar iniciou o serviço ativo em ${formattedDate}. Por favor, escolha uma data igual ou posterior.`);
         return;
       }
@@ -436,7 +382,7 @@ export default function FrequenciaManager({
 
         // Check if chronological consistency is met (not before admission date)
         if (milObj && milObj.data_inicio_servico && targetDate < milObj.data_inicio_servico) {
-          const formattedDate = new Date(milObj.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
+          const formattedDate = formatDateBR(milObj.data_inicio_servico);
           setModalError(`Erro: Militar ${milObj?.nome_guerra} iniciou serviço em ${formattedDate}. Impossível programar serviço em data anterior.`);
           setModalLoading(false);
           return;
@@ -463,7 +409,7 @@ export default function FrequenciaManager({
         });
       } else if (modalSelection === "fmo") {
         if (milObj && milObj.data_inicio_servico && targetDate < milObj.data_inicio_servico) {
-          const formattedDate = new Date(milObj.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
+          const formattedDate = formatDateBR(milObj.data_inicio_servico);
           setModalError(`Erro: Militar ${milObj?.nome_guerra} iniciou o serviço ativo em ${formattedDate}. Escolha data igual ou posterior.`);
           setModalLoading(false);
           return;
@@ -902,12 +848,9 @@ export default function FrequenciaManager({
 
                 // Grab event lists
                 const dayEscalas = stationEscalas.filter(esc => esc.data === exactDateStr);
-                const dayAfastamentos = stationAfastamentos.filter(ab => {
-                  const cur = new Date(exactDateStr + "T00:00:00");
-                  const dS = new Date(ab.data_inicio + "T00:00:00");
-                  const dE = new Date(ab.data_fim + "T00:00:00");
-                  return (cur >= dS && cur <= dE);
-                });
+                const dayAfastamentos = stationAfastamentos.filter(ab =>
+                  isDateKeyInRange(exactDateStr, ab.data_inicio, ab.data_fim)
+                );
                 const dayFmos = stationFmos.filter(fmo => fmo.data === exactDateStr);
 
                 const filteredEscalas = focusedBombeiroId === "all" 
@@ -1040,7 +983,7 @@ export default function FrequenciaManager({
                             tooltip = `Folga Mensal Obrigatória (FMO) em ${dCell.dayNum}/${selectedMonth}`;
                           } else if (dayEscala) {
                             cellBg = "bg-red-500/15 border-red-500/25 text-red-500 hover:bg-red-500/25";
-                            cellText = dayEscala.periodo === "24h" ? "24" : dayEscala.periodo.includes("Diurno") ? "D12" : "N12";
+                            cellText = periodoAbrev(dayEscala.periodo);
                             tooltip = `Escalado no Plantão: ${dayEscala.funcao} (${dayEscala.periodo})`;
                           }
 
@@ -1085,7 +1028,7 @@ export default function FrequenciaManager({
                   <div>
                     <h3 className="text-sm font-black text-white uppercase tracking-widest">Painel Operacional do Dia</h3>
                     <div className="text-[11px] font-mono font-bold text-red-500 mt-0.5 animate-pulse">
-                      📅 DATA: {new Date(activeCellModal.dateStr + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
+                      📅 DATA: {formatDateBR(activeCellModal.dateStr, { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
                     </div>
                   </div>
                   <button 
@@ -1126,12 +1069,10 @@ export default function FrequenciaManager({
                     // Filter existing items
                     const dayEscalas = stationEscalas.filter(e => e.data === exactDate && (bId === "all" || e.bombeiro_id === bId));
                     const dayFmos = stationFmos.filter(f => f.data === exactDate && (bId === "all" || f.bombeiro_id === bId));
-                    const dayAfastamentos = stationAfastamentos.filter(ab => {
-                      const cur = new Date(exactDate + "T00:00:00");
-                      const dS = new Date(ab.data_inicio + "T00:00:00");
-                      const dE = new Date(ab.data_fim + "T00:00:00");
-                      return (ab.bombeiro_id === bId || bId === "all") && (cur >= dS && cur <= dE);
-                    });
+                    const dayAfastamentos = stationAfastamentos.filter(ab =>
+                      (ab.bombeiro_id === bId || bId === "all") &&
+                      isDateKeyInRange(exactDate, ab.data_inicio, ab.data_fim)
+                    );
 
                     const empty = dayEscalas.length === 0 && dayFmos.length === 0 && dayAfastamentos.length === 0;
 
@@ -1290,7 +1231,7 @@ export default function FrequenciaManager({
                         <div>
                           <label className="block text-[8.5px] uppercase font-black text-slate-400 mb-1.5">Turno de Expedição</label>
                           <div className="grid grid-cols-3 gap-2">
-                            {["24h", "Diurno 12h", "Noturno 12h"].map((p) => (
+                            {PERIODOS_ESCALA.map((p) => (
                               <button
                                 key={p}
                                 type="button"

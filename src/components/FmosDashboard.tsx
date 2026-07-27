@@ -4,6 +4,8 @@ import {
   Clock, RefreshCw, BarChart2, ShieldCheck, HelpCircle
 } from "lucide-react";
 import { Bombeiro, Afastamento, Fmo } from "../types";
+import { MS_POR_DIA, formatDateBR, formatDateRangeAbrev, parseDateKey, toLocalDateKey } from "../lib/dates";
+import { getProntidaoDoDia } from "../lib/prontidao";
 
 interface FmosDashboardProps {
   selectedQuartelId: string;
@@ -13,28 +15,6 @@ interface FmosDashboardProps {
   onAddFmo?: (data: Omit<Fmo, "id">) => Promise<void>;
   onDeleteFmo?: (id: string) => Promise<void>;
   isAdmin?: boolean;
-}
-
-// Color reference function matching current system calendar cadence
-function getProntidaoDoDia(date: Date): "VERDE" | "AMARELA" | "AZUL" {
-  const reference = new Date(2026, 0, 1).getTime();
-  const target = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-  const diffDays = Math.round((target - reference) / (1000 * 60 * 60 * 24));
-  const idx = ((diffDays % 3) + 3) % 3;
-  const choices = ["VERDE", "AMARELA", "AZUL"] as const;
-  return choices[idx];
-}
-
-// Helper to format ranges nicely
-function formatRangeStr(startStr: string, endStr: string): string {
-  const monthsBr = ["JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ"];
-  const dStart = new Date(startStr + "T12:00:00");
-  const dEnd = new Date(endStr + "T12:00:00");
-  const startDay = String(dStart.getDate()).padStart(2, "0");
-  const startMonth = monthsBr[dStart.getMonth()];
-  const endDay = String(dEnd.getDate()).padStart(2, "0");
-  const endMonth = monthsBr[dEnd.getMonth()];
-  return `${startDay}${startMonth} a ${endDay}${endMonth}`;
 }
 
 export function calculateFmoStatus(
@@ -74,28 +54,20 @@ export function calculateFmoStatus(
   // Faster lookup index of dates
   const afMap = new Map<string, string>(); // yyyy-mm-dd -> type
   bAfastamentos.forEach(af => {
-    const s = new Date(af.data_inicio + "T12:00:00");
-    const e = new Date(af.data_fim + "T12:00:00");
-    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
-      const yyyy = d.getFullYear();
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      afMap.set(`${yyyy}-${mm}-${dd}`, af.tipo);
+    const e = parseDateKey(af.data_fim);
+    for (let d = parseDateKey(af.data_inicio); d <= e; d.setDate(d.getDate() + 1)) {
+      afMap.set(toLocalDateKey(d), af.tipo);
     }
   });
 
   const fmoSet = new Set<string>();
   bFmos.forEach(f => fmoSet.add(f.data));
 
-  const msInDay = 24 * 60 * 60 * 1000;
-  const totalDays = Math.round((end.getTime() - start.getTime()) / msInDay) + 1;
+  const totalDays = Math.round((end.getTime() - start.getTime()) / MS_POR_DIA) + 1;
 
   for (let i = 0; i < totalDays; i++) {
-    const curDate = new Date(start.getTime() + i * msInDay);
-    const yyyy = curDate.getFullYear();
-    const mm = String(curDate.getMonth() + 1).padStart(2, "0");
-    const dd = String(curDate.getDate()).padStart(2, "0");
-    const dateStr = `${yyyy}-${mm}-${dd}`;
+    const curDate = new Date(start.getTime() + i * MS_POR_DIA);
+    const dateStr = toLocalDateKey(curDate);
 
     // On-duty day according to the firefighters team color rotation
     if (getProntidaoDoDia(curDate) === equipe) {
@@ -142,7 +114,7 @@ export function calculateFmoStatus(
   let concessaoRange = "";
   if (cycles.length > 0) {
     const lastCycle = cycles[cycles.length - 1];
-    concessaoRange = formatRangeStr(lastCycle.inicio, lastCycle.fim);
+    concessaoRange = formatDateRangeAbrev(lastCycle.inicio, lastCycle.fim);
   }
 
   // Predict future shift date for completing the current 9-shift cycle
@@ -157,11 +129,8 @@ export function calculateFmoStatus(
     let found = false;
     
     for (let dForward = 0; dForward < 200; dForward++) {
-      const checkDate = new Date(today.getTime() + dForward * msInDay);
-      const yStr = checkDate.getFullYear();
-      const mStr = String(checkDate.getMonth() + 1).padStart(2, "0");
-      const dStr = String(checkDate.getDate()).padStart(2, "0");
-      const checkDateStr = `${yStr}-${mStr}-${dStr}`;
+      const checkDate = new Date(today.getTime() + dForward * MS_POR_DIA);
+      const checkDateStr = toLocalDateKey(checkDate);
 
       if (getProntidaoDoDia(checkDate) === equipe) {
         const afTipo = afMap.get(checkDateStr);
@@ -177,7 +146,7 @@ export function calculateFmoStatus(
         } else {
           tempProgress += 1;
           if (tempProgress === 9) {
-            previsaoConclusao = `${dStr}/${mStr}/${yStr}`;
+            previsaoConclusao = formatDateBR(checkDate);
             found = true;
             break;
           }
@@ -292,7 +261,7 @@ export default function FmosDashboard({
             <span>Regramento Operacional</span>
           </button>
           <div className="font-mono text-[10px] text-slate-500 bg-white/[0.02] border border-white/5 py-2 px-3 rounded-xl">
-            Sincronizado: {new Date().toLocaleDateString("pt-BR")}
+            Sincronizado: {formatDateBR(new Date())}
           </div>
         </div>
       </div>

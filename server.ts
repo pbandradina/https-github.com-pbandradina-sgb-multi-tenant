@@ -3,6 +3,16 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import pg from "pg";
 import dotenv from "dotenv";
+import { toDateKey } from "./src/lib/dates";
+import {
+  ActivePool,
+  buildInsert,
+  buildUpsert,
+  respondWithDelete,
+  respondWithRows,
+  upsertCacheItem,
+  valuesOf
+} from "./src/server/dbFallback";
 
 dotenv.config();
 
@@ -47,18 +57,12 @@ let mockBombeiros = [
   { id: "b12", quartel_id: "q3", nome: "Thiago Gomes", nome_guerra: "Sd Gomes", re: "185.201-2", posto_grad: "Soldado", status: "Ativo", telefone: "(18) 99611-0022", especialidades: "Combate a Incêndio, Resgate", data_inicio_servico: "2022-09-01", regime: "PRONTIDÃO", equipe: "VERDE" }
 ];
 
-// Helper to convert date to YYYY-MM-DD
-const formatDate = (d: Date | string) => {
-  const date = new Date(d);
-  return date.toISOString().split("T")[0];
-};
-
 let mockEscalas = [
-  { id: "e1", quartel_id: "q1", data: formatDate(new Date()), bombeiro_id: "b3", funcao: "Chefe de Guarnição / Comandante", periodo: "24h" },
-  { id: "e2", quartel_id: "q1", data: formatDate(new Date()), bombeiro_id: "b4", funcao: "Motorista da Auto Bomba (ABS)", periodo: "24h" },
-  { id: "e3", quartel_id: "q1", data: formatDate(new Date()), bombeiro_id: "b5", funcao: "Socorrista da Unidade de Resgate (UR)", periodo: "24h" },
-  { id: "e4", quartel_id: "q1", data: formatDate(new Date()), bombeiro_id: "b6", funcao: "Auxiliar de Combate", periodo: "24h" },
-  { id: "e5", quartel_id: "q1", data: formatDate(new Date()), bombeiro_id: "b7", funcao: "Operador de Telecomunicações", periodo: "24h" }
+  { id: "e1", quartel_id: "q1", data: toDateKey(new Date()), bombeiro_id: "b3", funcao: "Chefe de Guarnição / Comandante", periodo: "24h" },
+  { id: "e2", quartel_id: "q1", data: toDateKey(new Date()), bombeiro_id: "b4", funcao: "Motorista da Auto Bomba (ABS)", periodo: "24h" },
+  { id: "e3", quartel_id: "q1", data: toDateKey(new Date()), bombeiro_id: "b5", funcao: "Socorrista da Unidade de Resgate (UR)", periodo: "24h" },
+  { id: "e4", quartel_id: "q1", data: toDateKey(new Date()), bombeiro_id: "b6", funcao: "Auxiliar de Combate", periodo: "24h" },
+  { id: "e5", quartel_id: "q1", data: toDateKey(new Date()), bombeiro_id: "b7", funcao: "Operador de Telecomunicações", periodo: "24h" }
 ];
 
 let mockViaturas = [
@@ -91,6 +95,21 @@ let mockFmos = [
 let mockAdmins = [
   { username: "admin", nome: "Administrador 20º GB", password: "sgb20gb" }
 ];
+
+// Column order shared by the generated INSERT/UPSERT statements and the seeding routine
+const COLUNAS_QUARTEIS = ["id", "nome", "cidade", "subgrupamento"];
+const COLUNAS_BOMBEIROS = ["id", "quartel_id", "nome", "nome_guerra", "re", "posto_grad", "status", "telefone", "especialidades", "data_inicio_servico", "regime", "equipe"];
+const COLUNAS_ESCALAS = ["id", "quartel_id", "data", "bombeiro_id", "funcao", "periodo"];
+const COLUNAS_VIATURAS = ["id", "quartel_id", "codigo", "tipo", "status", "escala_atual"];
+const COLUNAS_OCORRENCIAS = ["id", "quartel_id", "codigo", "tipo", "endereco", "viatura_id", "status", "criado_em", "fechado_em", "historico"];
+const COLUNAS_MURAL = ["id", "quartel_id", "titulo", "conteudo", "bombeiro_re", "criado_em"];
+const COLUNAS_AFASTAMENTOS = ["id", "quartel_id", "bombeiro_id", "data_inicio", "data_fim", "tipo", "justificativa"];
+const COLUNAS_FMOS = ["id", "quartel_id", "bombeiro_id", "data", "justificativa"];
+
+// Pool only while the database is really reachable; null routes the request to the in-memory cache
+const activePool = (): ActivePool => (isDbConnected && pool ? pool : null);
+
+const normalizeUsername = (username: string) => username.toLowerCase().trim();
 
 // Iniciar conexão com Supabase Postgres
 async function initDb() {
@@ -218,16 +237,14 @@ async function initDb() {
     console.log("Banco de dados verificado/estruturado com sucesso.");
 
     // Seeding/Updating standard 20º GB fire stations
-    for (const q of mockQuarteis) {
-      await pool.query(`
-        INSERT INTO quarteis (id, nome, cidade, subgrupamento)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (id) DO UPDATE SET
-          nome = EXCLUDED.nome,
-          cidade = EXCLUDED.cidade,
-          subgrupamento = EXCLUDED.subgrupamento
-      `, [q.id, q.nome, q.cidade, q.subgrupamento]);
-    }
+    const seedRows = async (table: string, columns: string[], rows: Record<string, unknown>[], sql?: string) => {
+      const statement = sql || buildInsert(table, columns);
+      for (const row of rows) {
+        await pool!.query(statement, valuesOf(columns, row));
+      }
+    };
+
+    await seedRows("quarteis", COLUNAS_QUARTEIS, mockQuarteis, buildUpsert("quarteis", COLUNAS_QUARTEIS));
     console.log("Seeding dos Quartéis (1º e 2º SGB do 20º GB) finalizado.");
 
     // Seeding default administrator if empty
@@ -244,34 +261,13 @@ async function initDb() {
     const countBombeiros = await pool.query("SELECT COUNT(*) FROM bombeiros");
     if (parseInt(countBombeiros.rows[0].count) === 0) {
       console.log("Banco de dados vazio! Populando dados iniciais das guarnições...");
-      for (const b of mockBombeiros) {
-        await pool.query("INSERT INTO bombeiros (id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)", 
-          [b.id, b.quartel_id, b.nome, b.nome_guerra, b.re, b.posto_grad, b.status, b.telefone, b.especialidades, b.data_inicio_servico, b.regime || "PRONTIDÃO", b.equipe || ""]);
-      }
-      for (const e of mockEscalas) {
-        await pool.query("INSERT INTO escalas (id, quartel_id, data, bombeiro_id, funcao, periodo) VALUES ($1, $2, $3, $4, $5, $6)", 
-          [e.id, e.quartel_id, e.data, e.bombeiro_id, e.funcao, e.periodo]);
-      }
-      for (const v of mockViaturas) {
-        await pool.query("INSERT INTO viaturas (id, quartel_id, codigo, tipo, status, escala_atual) VALUES ($1, $2, $3, $4, $5, $6)", 
-          [v.id, v.quartel_id, v.codigo, v.tipo, v.status, v.escala_atual]);
-      }
-      for (const o of mockOcorrencias) {
-        await pool.query("INSERT INTO ocorrencias (id, quartel_id, codigo, tipo, endereco, viatura_id, status, criado_em, fechado_em, historico) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", 
-          [o.id, o.quartel_id, o.codigo, o.tipo, o.endereco, o.viatura_id, o.status, o.criado_em, o.fechado_em, o.historico]);
-      }
-      for (const m of mockMural) {
-        await pool.query("INSERT INTO mural_avisos (id, quartel_id, titulo, conteudo, bombeiro_re, criado_em) VALUES ($1, $2, $3, $4, $5, $6)", 
-          [m.id, m.quartel_id, m.titulo, m.conteudo, m.bombeiro_re, m.criado_em]);
-      }
-      for (const af of mockAfastamentos) {
-        await pool.query("INSERT INTO afastamentos (id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-          [af.id, af.quartel_id, af.bombeiro_id, af.data_inicio, af.data_fim, af.tipo, af.justificativa]);
-      }
-      for (const fmo of mockFmos) {
-        await pool.query("INSERT INTO fmos (id, quartel_id, bombeiro_id, data, justificativa) VALUES ($1, $2, $3, $4, $5)",
-          [fmo.id, fmo.quartel_id, fmo.bombeiro_id, fmo.data, fmo.justificativa]);
-      }
+      await seedRows("bombeiros", COLUNAS_BOMBEIROS, mockBombeiros);
+      await seedRows("escalas", COLUNAS_ESCALAS, mockEscalas);
+      await seedRows("viaturas", COLUNAS_VIATURAS, mockViaturas);
+      await seedRows("ocorrencias", COLUNAS_OCORRENCIAS, mockOcorrencias);
+      await seedRows("mural_avisos", COLUNAS_MURAL, mockMural);
+      await seedRows("afastamentos", COLUNAS_AFASTAMENTOS, mockAfastamentos);
+      await seedRows("fmos", COLUNAS_FMOS, mockFmos);
       console.log("Dados iniciais semeados com sucesso.");
     }
     
@@ -299,55 +295,37 @@ app.get("/api/status", (req, res) => {
 });
 
 // 2. Quarteis (Unidades)
-app.get("/api/quarteis", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM quarteis ORDER BY nome");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockQuarteis);
+app.get("/api/quarteis", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM quarteis ORDER BY nome", mockQuarteis);
 });
 
 // 3. Bombeiros (Efetivo)
-app.get("/api/bombeiros", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM bombeiros ORDER BY posto_grad ASC, nome ASC");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockBombeiros);
+app.get("/api/bombeiros", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM bombeiros ORDER BY posto_grad ASC, nome ASC", mockBombeiros);
 });
 
 app.post("/api/bombeiros", async (req, res) => {
   const { id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe } = req.body;
-  const newId = id || "b_" + Date.now();
-  
-  if (isDbConnected && pool) {
+  const data = {
+    id: id || "b_" + Date.now(),
+    quartel_id,
+    nome,
+    nome_guerra,
+    re,
+    posto_grad,
+    status: status || "Ativo",
+    telefone,
+    especialidades,
+    data_inicio_servico,
+    regime: regime || "PRONTIDÃO",
+    equipe: equipe || ""
+  };
+  const db = activePool();
+
+  if (db) {
     try {
-      await pool.query(`
-        INSERT INTO bombeiros (id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          nome = EXCLUDED.nome,
-          nome_guerra = EXCLUDED.nome_guerra,
-          re = EXCLUDED.re,
-          posto_grad = EXCLUDED.posto_grad,
-          status = EXCLUDED.status,
-          telefone = EXCLUDED.telefone,
-          especialidades = EXCLUDED.especialidades,
-          data_inicio_servico = EXCLUDED.data_inicio_servico,
-          regime = EXCLUDED.regime,
-          equipe = EXCLUDED.equipe
-      `, [newId, quartel_id, nome, nome_guerra, re, posto_grad, status || "Ativo", telefone, especialidades, data_inicio_servico, regime || "PRONTIDÃO", equipe || ""]);
-      
-      const updated = await pool.query("SELECT * FROM bombeiros WHERE id = $1", [newId]);
+      await db.query(buildUpsert("bombeiros", COLUNAS_BOMBEIROS), valuesOf(COLUNAS_BOMBEIROS, data));
+      const updated = await db.query("SELECT * FROM bombeiros WHERE id = $1", [data.id]);
       return res.json(updated.rows[0]);
     } catch (e) {
       console.error("Erro ao salvar bombeiro:", e);
@@ -355,124 +333,74 @@ app.post("/api/bombeiros", async (req, res) => {
     }
   }
 
-  // Fallback Local Cache
-  const existingIndex = mockBombeiros.findIndex(b => b.id === newId);
-  const data = { id: newId, quartel_id, nome, nome_guerra, re, posto_grad, status: status || "Ativo", telefone, especialidades, data_inicio_servico, regime: regime || "PRONTIDÃO", equipe: equipe || "" };
-  if (existingIndex > -1) {
-    mockBombeiros[existingIndex] = data;
-  } else {
-    mockBombeiros.push(data);
-  }
-  res.json(data);
+  res.json(upsertCacheItem(mockBombeiros, data));
 });
 
-app.delete("/api/bombeiros/:id", async (req, res) => {
+app.delete("/api/bombeiros/:id", (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM bombeiros WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar" });
-    }
-  }
-  mockBombeiros = mockBombeiros.filter(b => b.id !== id);
-  res.json({ success: true });
+  respondWithDelete(res, activePool(), "bombeiros", id, () => {
+    mockBombeiros = mockBombeiros.filter(b => b.id !== id);
+  });
 });
 
 // 4. Escalas de Plantão (Shifts)
-app.get("/api/escalas", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM escalas ORDER BY data DESC");
-      // Map postgres date properly (strip timestamp text)
-      const mapped = result.rows.map(row => ({
-        ...row,
-        data: formatDate(row.data)
-      }));
-      return res.json(mapped);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockEscalas);
+app.get("/api/escalas", (req, res) => {
+  // Map postgres date properly (strip timestamp text)
+  respondWithRows(res, activePool(), "SELECT * FROM escalas ORDER BY data DESC", mockEscalas, row => ({
+    ...row,
+    data: toDateKey(row.data as string)
+  }));
 });
 
 app.post("/api/escalas", async (req, res) => {
   const { id, quartel_id, data, bombeiro_id, funcao, periodo } = req.body;
-  const newId = id || "e_" + Date.now();
-  const rawDate = formatDate(data);
+  const dataset = {
+    id: id || "e_" + Date.now(),
+    quartel_id,
+    data: toDateKey(data),
+    bombeiro_id,
+    funcao,
+    periodo
+  };
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(`
-        INSERT INTO escalas (id, quartel_id, data, bombeiro_id, funcao, periodo)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          data = EXCLUDED.data,
-          bombeiro_id = EXCLUDED.bombeiro_id,
-          funcao = EXCLUDED.funcao,
-          periodo = EXCLUDED.periodo
-      `, [newId, quartel_id, rawDate, bombeiro_id, funcao, periodo]);
-      return res.json({ id: newId, quartel_id, data: rawDate, bombeiro_id, funcao, periodo });
+      await db.query(buildUpsert("escalas", COLUNAS_ESCALAS), valuesOf(COLUNAS_ESCALAS, dataset));
+      return res.json(dataset);
     } catch (e) {
       console.error("Erro ao salvar escala:", e);
       return res.status(500).json({ error: "Erro ao salvar escala" });
     }
   }
 
-  // Fallback Local
-  const existingIndex = mockEscalas.findIndex(e => e.id === newId);
-  const dataset = { id: newId, quartel_id, data: rawDate, bombeiro_id, funcao, periodo };
-  if (existingIndex > -1) {
-    mockEscalas[existingIndex] = dataset;
-  } else {
-    mockEscalas.push(dataset);
-  }
-  res.json(dataset);
+  res.json(upsertCacheItem(mockEscalas, dataset));
 });
 
-app.delete("/api/escalas/:id", async (req, res) => {
+app.delete("/api/escalas/:id", (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM escalas WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar" });
-    }
-  }
-  mockEscalas = mockEscalas.filter(e => e.id !== id);
-  res.json({ success: true });
+  respondWithDelete(res, activePool(), "escalas", id, () => {
+    mockEscalas = mockEscalas.filter(e => e.id !== id);
+  });
 });
 
 // 5. Viaturas (Fleet)
-app.get("/api/viaturas", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM viaturas ORDER BY codigo");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockViaturas);
+app.get("/api/viaturas", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM viaturas ORDER BY codigo", mockViaturas);
 });
 
 app.put("/api/viaturas/:id", async (req, res) => {
   const { id } = req.params;
   const { status, escala_atual } = req.body;
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(
+      await db.query(
         "UPDATE viaturas SET status = $1, escala_atual = $2 WHERE id = $3",
         [status, escala_atual, id]
       );
-      const updated = await pool.query("SELECT * FROM viaturas WHERE id = $1", [id]);
+      const updated = await db.query("SELECT * FROM viaturas WHERE id = $1", [id]);
       return res.json(updated.rows[0]);
     } catch (e) {
       console.error(e);
@@ -489,39 +417,37 @@ app.put("/api/viaturas/:id", async (req, res) => {
 });
 
 // 6. Ocorrências (Dispatches)
-app.get("/api/ocorrencias", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM ocorrencias ORDER BY criado_em DESC");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockOcorrencias);
+app.get("/api/ocorrencias", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM ocorrencias ORDER BY criado_em DESC", mockOcorrencias);
 });
 
 app.post("/api/ocorrencias", async (req, res) => {
   const { id, quartel_id, tipo, endereco, viatura_id, status, historico, criado_em, fechado_em } = req.body;
   const newId = id || "o_" + Date.now();
   const finalCode = "OCO-" + new Date().getFullYear() + "-" + Math.floor(100 + Math.random() * 900);
-  const startTime = criado_em || new Date().toISOString();
+  const cached = mockOcorrencias.find(o => o.id === newId);
+  const data = {
+    id: newId,
+    quartel_id,
+    codigo: cached ? cached.codigo : finalCode,
+    tipo,
+    endereco,
+    viatura_id,
+    status: status || "Ativa",
+    criado_em: criado_em || new Date().toISOString(),
+    fechado_em: fechado_em || null,
+    historico
+  };
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(`
-        INSERT INTO ocorrencias (id, quartel_id, codigo, tipo, endereco, viatura_id, status, criado_em, fechado_em, historico)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (id) DO UPDATE SET
-          tipo = EXCLUDED.tipo,
-          endereco = EXCLUDED.endereco,
-          viatura_id = EXCLUDED.viatura_id,
-          status = EXCLUDED.status,
-          fechado_em = EXCLUDED.fechado_em,
-          historico = EXCLUDED.historico
-      `, [newId, quartel_id, finalCode, tipo, endereco, viatura_id, status || "Ativa", startTime, fechado_em, historico]);
-      
-      const loaded = await pool.query("SELECT * FROM ocorrencias WHERE id = $1", [newId]);
+      // Código, quartel e abertura permanecem imutáveis após o registro inicial
+      const statement = buildUpsert("ocorrencias", COLUNAS_OCORRENCIAS, {
+        updateColumns: ["tipo", "endereco", "viatura_id", "status", "fechado_em", "historico"]
+      });
+      await db.query(statement, valuesOf(COLUNAS_OCORRENCIAS, { ...data, codigo: finalCode }));
+      const loaded = await db.query("SELECT * FROM ocorrencias WHERE id = $1", [newId]);
       return res.json(loaded.rows[0]);
     } catch (e) {
       console.error(e);
@@ -529,40 +455,22 @@ app.post("/api/ocorrencias", async (req, res) => {
     }
   }
 
-  const existingIndex = mockOcorrencias.findIndex(o => o.id === newId);
-  const data = {
-    id: newId,
-    quartel_id,
-    codigo: existingIndex > -1 ? mockOcorrencias[existingIndex].codigo : finalCode,
-    tipo,
-    endereco,
-    viatura_id,
-    status: status || "Ativa",
-    criado_em: startTime,
-    fechado_em: fechado_em || null,
-    historico
-  };
-
-  if (existingIndex > -1) {
-    mockOcorrencias[existingIndex] = data;
-  } else {
-    mockOcorrencias.unshift(data);
-  }
-  res.json(data);
+  res.json(upsertCacheItem(mockOcorrencias, data, "start"));
 });
 
 app.put("/api/ocorrencias/:id/fechar", async (req, res) => {
   const { id } = req.params;
   const { historico } = req.body;
   const now = new Date().toISOString();
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(
+      await db.query(
         "UPDATE ocorrencias SET status = 'Finalizada', fechado_em = $1, historico = $2 WHERE id = $3",
         [now, historico, id]
       );
-      const loaded = await pool.query("SELECT * FROM ocorrencias WHERE id = $1", [id]);
+      const loaded = await db.query("SELECT * FROM ocorrencias WHERE id = $1", [id]);
       return res.json(loaded.rows[0]);
     } catch (e) {
       console.error(e);
@@ -581,190 +489,121 @@ app.put("/api/ocorrencias/:id/fechar", async (req, res) => {
 });
 
 // 7. Mural de Avisos
-app.get("/api/mural", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM mural_avisos ORDER BY criado_em DESC");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockMural);
+app.get("/api/mural", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM mural_avisos ORDER BY criado_em DESC", mockMural);
 });
 
 app.post("/api/mural", async (req, res) => {
   const { title, content, authorRe, quartelId } = req.body;
-  const id = "m_" + Date.now();
-  const timestamp = new Date().toISOString();
+  const post = {
+    id: "m_" + Date.now(),
+    quartel_id: quartelId || "q1",
+    titulo: title,
+    conteudo: content,
+    bombeiro_re: authorRe || "145.230-1",
+    criado_em: new Date().toISOString()
+  };
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(
-        "INSERT INTO mural_avisos (id, quartel_id, titulo, conteudo, bombeiro_re, criado_em) VALUES ($1, $2, $3, $4, $5, $6)",
-        [id, quartelId || "q1", title, content, authorRe || "145.230-1", timestamp]
-      );
-      return res.json({ id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe, criado_em: timestamp });
+      await db.query(buildInsert("mural_avisos", COLUNAS_MURAL), valuesOf(COLUNAS_MURAL, post));
+      return res.json(post);
     } catch (e) {
       console.error(e);
       return res.status(500).json({ error: "Erro ao registrar aviso" });
     }
   }
 
-  const post = { id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe || "145.230-1", criado_em: timestamp };
-  mockMural.unshift(post);
-  res.json(post);
+  res.json(upsertCacheItem(mockMural, post, "start"));
 });
 
-app.delete("/api/mural/:id", async (req, res) => {
+app.delete("/api/mural/:id", (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM mural_avisos WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar" });
-    }
-  }
-  mockMural = mockMural.filter(m => m.id !== id);
-  res.json({ success: true });
+  respondWithDelete(res, activePool(), "mural_avisos", id, () => {
+    mockMural = mockMural.filter(m => m.id !== id);
+  });
 });
 
 // --- AFASTAMENTOS ENDPOINTS ---
-app.get("/api/afastamentos", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM afastamentos ORDER BY data_inicio DESC");
-      const mapped = result.rows.map(row => ({
-        ...row,
-        data_inicio: formatDate(row.data_inicio),
-        data_fim: formatDate(row.data_fim)
-      }));
-      return res.json(mapped);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockAfastamentos);
+app.get("/api/afastamentos", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM afastamentos ORDER BY data_inicio DESC", mockAfastamentos, row => ({
+    ...row,
+    data_inicio: toDateKey(row.data_inicio as string),
+    data_fim: toDateKey(row.data_fim as string)
+  }));
 });
 
 app.post("/api/afastamentos", async (req, res) => {
   const { id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa } = req.body;
-  const newId = id || "af_" + Date.now();
-  const rawStart = formatDate(data_inicio);
-  const rawEnd = formatDate(data_fim);
+  const dataset = {
+    id: id || "af_" + Date.now(),
+    quartel_id,
+    bombeiro_id,
+    data_inicio: toDateKey(data_inicio),
+    data_fim: toDateKey(data_fim),
+    tipo,
+    justificativa
+  };
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(`
-        INSERT INTO afastamentos (id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          bombeiro_id = EXCLUDED.bombeiro_id,
-          data_inicio = EXCLUDED.data_inicio,
-          data_fim = EXCLUDED.data_fim,
-          tipo = EXCLUDED.tipo,
-          justificativa = EXCLUDED.justificativa
-      `, [newId, quartel_id, bombeiro_id, rawStart, rawEnd, tipo, justificativa]);
-      return res.json({ id: newId, quartel_id, bombeiro_id, data_inicio: rawStart, data_fim: rawEnd, tipo, justificativa });
+      await db.query(buildUpsert("afastamentos", COLUNAS_AFASTAMENTOS), valuesOf(COLUNAS_AFASTAMENTOS, dataset));
+      return res.json(dataset);
     } catch (e) {
       console.error("Erro ao salvar afastamento:", e);
       return res.status(500).json({ error: "Erro ao salvar afastamento" });
     }
   }
 
-  // Fallback Local Cache
-  const existingIndex = mockAfastamentos.findIndex(af => af.id === newId);
-  const dataset = { id: newId, quartel_id, bombeiro_id, data_inicio: rawStart, data_fim: rawEnd, tipo, justificativa };
-  if (existingIndex > -1) {
-    mockAfastamentos[existingIndex] = dataset;
-  } else {
-    mockAfastamentos.push(dataset);
-  }
-  res.json(dataset);
+  res.json(upsertCacheItem(mockAfastamentos, dataset));
 });
 
-app.delete("/api/afastamentos/:id", async (req, res) => {
+app.delete("/api/afastamentos/:id", (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM afastamentos WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar afastamento" });
-    }
-  }
-  mockAfastamentos = mockAfastamentos.filter(af => af.id !== id);
-  res.json({ success: true });
+  respondWithDelete(res, activePool(), "afastamentos", id, () => {
+    mockAfastamentos = mockAfastamentos.filter(af => af.id !== id);
+  }, "Erro ao deletar afastamento");
 });
 
 // --- FMOS ENDPOINTS ---
-app.get("/api/fmos", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT * FROM fmos ORDER BY data DESC");
-      const mapped = result.rows.map(row => ({
-        ...row,
-        data: formatDate(row.data)
-      }));
-      return res.json(mapped);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockFmos);
+app.get("/api/fmos", (req, res) => {
+  respondWithRows(res, activePool(), "SELECT * FROM fmos ORDER BY data DESC", mockFmos, row => ({
+    ...row,
+    data: toDateKey(row.data as string)
+  }));
 });
 
 app.post("/api/fmos", async (req, res) => {
   const { id, quartel_id, bombeiro_id, data, justificativa } = req.body;
-  const newId = id || "fmo_" + Date.now();
-  const rawDate = formatDate(data);
+  const dataset = {
+    id: id || "fmo_" + Date.now(),
+    quartel_id,
+    bombeiro_id,
+    data: toDateKey(data),
+    justificativa
+  };
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      await pool.query(`
-        INSERT INTO fmos (id, quartel_id, bombeiro_id, data, justificativa)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (id) DO UPDATE SET
-          quartel_id = EXCLUDED.quartel_id,
-          bombeiro_id = EXCLUDED.bombeiro_id,
-          data = EXCLUDED.data,
-          justificativa = EXCLUDED.justificativa
-      `, [newId, quartel_id, bombeiro_id, rawDate, justificativa]);
-      return res.json({ id: newId, quartel_id, bombeiro_id, data: rawDate, justificativa });
+      await db.query(buildUpsert("fmos", COLUNAS_FMOS), valuesOf(COLUNAS_FMOS, dataset));
+      return res.json(dataset);
     } catch (e) {
       console.error("Erro ao salvar FMO:", e);
       return res.status(500).json({ error: "Erro ao salvar FMO" });
     }
   }
 
-  // Fallback Local Cache
-  const existingIndex = mockFmos.findIndex(fmo => fmo.id === newId);
-  const dataset = { id: newId, quartel_id, bombeiro_id, data: rawDate, justificativa };
-  if (existingIndex > -1) {
-    mockFmos[existingIndex] = dataset;
-  } else {
-    mockFmos.push(dataset);
-  }
-  res.json(dataset);
+  res.json(upsertCacheItem(mockFmos, dataset));
 });
 
-app.delete("/api/fmos/:id", async (req, res) => {
+app.delete("/api/fmos/:id", (req, res) => {
   const { id } = req.params;
-  if (isDbConnected && pool) {
-    try {
-      await pool.query("DELETE FROM fmos WHERE id = $1", [id]);
-      return res.json({ success: true });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Erro ao deletar FMO" });
-    }
-  }
-  mockFmos = mockFmos.filter(fmo => fmo.id !== id);
-  res.json({ success: true });
+  respondWithDelete(res, activePool(), "fmos", id, () => {
+    mockFmos = mockFmos.filter(fmo => fmo.id !== id);
+  }, "Erro ao deletar FMO");
 });
 
 
@@ -776,9 +615,11 @@ app.post("/api/admins/login", async (req, res) => {
     return res.status(400).json({ error: "Preencha usuário e senha." });
   }
 
-  if (isDbConnected && pool) {
+  const db = activePool();
+
+  if (db) {
     try {
-      const result = await pool.query("SELECT * FROM administradores WHERE username = $1", [username.toLowerCase().trim()]);
+      const result = await db.query("SELECT * FROM administradores WHERE username = $1", [normalizeUsername(username)]);
       if (result.rows.length > 0 && result.rows[0].password === password) {
         const admin = result.rows[0];
         return res.json({ success: true, admin: { username: admin.username, nome: admin.nome } });
@@ -790,7 +631,7 @@ app.post("/api/admins/login", async (req, res) => {
     }
   }
 
-  const found = mockAdmins.find(a => a.username.toLowerCase().trim() === username.toLowerCase().trim() && a.password === password);
+  const found = mockAdmins.find(a => normalizeUsername(a.username) === normalizeUsername(username) && a.password === password);
   if (found) {
     return res.json({ success: true, admin: { username: found.username, nome: found.nome } });
   }
@@ -803,18 +644,16 @@ app.post("/api/admins/register", async (req, res) => {
     return res.status(400).json({ error: "Preencha usuário, nome e senha." });
   }
 
-  const cleanUser = username.toLowerCase().trim();
+  const cleanUser = normalizeUsername(username);
+  const db = activePool();
 
-  if (isDbConnected && pool) {
+  if (db) {
     try {
-      const exists = await pool.query("SELECT * FROM administradores WHERE username = $1", [cleanUser]);
+      const exists = await db.query("SELECT * FROM administradores WHERE username = $1", [cleanUser]);
       if (exists.rows.length > 0) {
         return res.status(400).json({ error: "Nome de usuário administrador já cadastrado." });
       }
-      await pool.query(`
-        INSERT INTO administradores (username, nome, password) 
-        VALUES ($1, $2, $3)
-      `, [cleanUser, nome, password]);
+      await db.query(buildInsert("administradores", ["username", "nome", "password"]), [cleanUser, nome, password]);
       return res.json({ success: true, admin: { username: cleanUser, nome } });
     } catch (e) {
       console.error(e);
@@ -822,7 +661,7 @@ app.post("/api/admins/register", async (req, res) => {
     }
   }
 
-  const exists = mockAdmins.find(a => a.username.toLowerCase().trim() === cleanUser);
+  const exists = mockAdmins.find(a => normalizeUsername(a.username) === cleanUser);
   if (exists) {
     return res.status(400).json({ error: "Nome de usuário administrador já cadastrado." });
   }
@@ -830,16 +669,13 @@ app.post("/api/admins/register", async (req, res) => {
   res.json({ success: true, admin: { username: cleanUser, nome } });
 });
 
-app.get("/api/admins", async (req, res) => {
-  if (isDbConnected && pool) {
-    try {
-      const result = await pool.query("SELECT username, nome, criado_em FROM administradores ORDER BY nome");
-      return res.json(result.rows);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-  res.json(mockAdmins.map(a => ({ username: a.username, nome: a.nome, criado_em: new Date().toISOString() })));
+app.get("/api/admins", (req, res) => {
+  respondWithRows(
+    res,
+    activePool(),
+    "SELECT username, nome, criado_em FROM administradores ORDER BY nome",
+    mockAdmins.map(a => ({ username: a.username, nome: a.nome, criado_em: new Date().toISOString() }))
+  );
 });
 
 
