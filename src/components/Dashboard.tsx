@@ -5,9 +5,15 @@ import {
   MessageSquare, UserCheck, ChevronRight, ChevronLeft, Calendar
 } from "lucide-react";
 import { Bombeiro, Escala, Viatura, Ocorrencia, MuralPost, Afastamento, Fmo } from "../types";
+import { addDays, formatDateBR, isDateKeyInMonth, toDateKey, todayKey } from "../lib/dates";
+import { EQUIPES_PRONTIDAO, EquipeProntidao, getProntidaoDoDia } from "../lib/prontidao";
+import { horasDoPeriodo } from "../lib/escalas";
+import { findAfastamentoNaData, findFmoNaData } from "../lib/frequencia";
 
-const formatDate = (d: Date | string) => {
-  return new Date(d).toISOString().split("T")[0];
+const ESTILOS_PRONTIDAO: Record<EquipeProntidao, { color: string; border: string; text: string; bg: string }> = {
+  VERDE: { color: "bg-emerald-600", border: "border-emerald-500/30", text: "text-emerald-500", bg: "bg-emerald-50 text-emerald-800 border-emerald-100" },
+  AMARELA: { color: "bg-yellow-500", border: "border-yellow-500/30", text: "text-yellow-600", bg: "bg-yellow-50 text-yellow-800 border-yellow-100" },
+  AZUL: { color: "bg-blue-600", border: "border-blue-500/30", text: "text-blue-500", bg: "bg-blue-50 text-blue-800 border-blue-100" }
 };
 
 interface DashboardProps {
@@ -53,36 +59,16 @@ export default function Dashboard({
   const [dashboardDate, setDashboardDate] = useState<Date>(() => new Date());
 
   const handlePrevDay = () => {
-    setDashboardDate(prev => {
-      const next = new Date(prev);
-      next.setDate(next.getDate() - 1);
-      return next;
-    });
+    setDashboardDate(prev => addDays(prev, -1));
   };
 
   const handleNextDay = () => {
-    setDashboardDate(prev => {
-      const next = new Date(prev);
-      next.setDate(next.getDate() + 1);
-      return next;
-    });
+    setDashboardDate(prev => addDays(prev, 1));
   };
 
-  const getProntidaoDoDia = (date: Date) => {
-    const reference = new Date(2026, 0, 1).getTime();
-    const target = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-    const diffDays = Math.round((target - reference) / (1000 * 60 * 60 * 24));
-    const idx = ((diffDays % 3) + 3) % 3;
-    const choices = [
-      { name: "VERDE", color: "bg-emerald-600", border: "border-emerald-500/30", text: "text-emerald-500", bg: "bg-emerald-50 text-emerald-800 border-emerald-100" },
-      { name: "AMARELA", color: "bg-yellow-500", border: "border-yellow-500/30", text: "text-yellow-600", bg: "bg-yellow-50 text-yellow-800 border-yellow-100" },
-      { name: "AZUL", color: "bg-blue-600", border: "border-blue-500/30", text: "text-blue-500", bg: "bg-blue-50 text-blue-800 border-blue-100" }
-    ];
-    return choices[idx];
-  };
-
-  const activeProntidao = getProntidaoDoDia(dashboardDate);
-  const dateStr = formatDate(dashboardDate);
+  const equipeDoDia = getProntidaoDoDia(dashboardDate);
+  const activeProntidao = { name: equipeDoDia, ...ESTILOS_PRONTIDAO[equipeDoDia] };
+  const dateStr = toDateKey(dashboardDate);
 
   // Filter items specifically for the active selected station (Multi-tenant)
   const activeBombeiros = bombeiros.filter(b => b.quartel_id === selectedQuartelId);
@@ -90,7 +76,7 @@ export default function Dashboard({
   const activeMural = mural.filter(m => m.quartel_id === selectedQuartelId);
 
   // Active scales for today (standard overview for statistics)
-  const todayStr = new Date().toISOString().split("T")[0];
+  const todayStr = todayKey();
   const activeEscalasHoje = escalas.filter(
     e => e.quartel_id === selectedQuartelId && e.data === todayStr
   );
@@ -99,12 +85,9 @@ export default function Dashboard({
   const currentMonth = new Date().getMonth() + 1;
   const currentYear = 2026; // Match state years
 
-  const escalasMes = escalas.filter(e => {
-    if (e.quartel_id !== selectedQuartelId) return false;
-    const dStr = e.data; // "YYYY-MM-DD"
-    const d = new Date(dStr + "T00:00:00");
-    return (d.getMonth() + 1) === currentMonth && d.getFullYear() === currentYear;
-  });
+  const escalasMes = escalas.filter(
+    e => e.quartel_id === selectedQuartelId && isDateKeyInMonth(e.data, currentMonth, currentYear)
+  );
 
   let totalHorasTrabalhadasMes = 0;
   let totalPlantoesMes = 0;
@@ -114,15 +97,7 @@ export default function Dashboard({
     if (!bombeiro) return;
 
     totalPlantoesMes++;
-    if (p.periodo === "24h") {
-      totalHorasTrabalhadasMes += 24;
-    } else if (p.periodo === "Noturno 12h") {
-      totalHorasTrabalhadasMes += 12;
-    } else if (p.periodo === "Diurno 12h") {
-      totalHorasTrabalhadasMes += 12;
-    } else {
-      totalHorasTrabalhadasMes += 12;
-    }
+    totalHorasTrabalhadasMes += horasDoPeriodo(p.periodo).horas;
   });
 
   const stats = {
@@ -151,16 +126,11 @@ export default function Dashboard({
 
   // Helper to check standard absence string
   const getBombeiroAbsence = (bombeiroId: string) => {
-    const af = afastamentos.find(a => 
-      a.bombeiro_id === bombeiroId && 
-      dateStr >= a.data_inicio && 
-      dateStr <= a.data_fim
-    );
+    const af = findAfastamentoNaData(afastamentos, bombeiroId, dateStr);
     if (af) {
       return `Afastado (${af.tipo})`;
     }
-    const f = fmos.find(fm => fm.bombeiro_id === bombeiroId && fm.data === dateStr);
-    if (f) {
+    if (findFmoNaData(fmos, bombeiroId, dateStr)) {
       return `FMO (Folga Obrigatória)`;
     }
     return null;
@@ -212,10 +182,8 @@ export default function Dashboard({
     if (!onAddAfastamento || !onDeleteAfastamento) return;
     try {
       // Find matches for same exact firefighter on same date
-      const existingLeaves = afastamentos.filter(af => 
-        af.bombeiro_id === bombeiroId && 
-        dateStr >= af.data_inicio && 
-        dateStr <= af.data_fim
+      const existingLeaves = afastamentos.filter(af =>
+        af.bombeiro_id === bombeiroId && dateStr >= af.data_inicio && dateStr <= af.data_fim
       );
 
       // Clean old records
@@ -372,7 +340,7 @@ export default function Dashboard({
                 </button>
                 <div className="text-xs font-black px-2 text-slate-800 flex items-center gap-1 sm:min-w-[130px] justify-center tracking-tight">
                   <Calendar className="w-3.5 h-3.5 text-slate-400" />
-                  {new Date(dashboardDate).toLocaleDateString("pt-BR", { day: 'numeric', month: 'short' })}
+                  {formatDateBR(dashboardDate, { day: 'numeric', month: 'short' })}
                 </div>
                 <button 
                   onClick={handleNextDay}
@@ -387,7 +355,7 @@ export default function Dashboard({
             {/* Scale team indicators */}
             <div className="flex flex-wrap items-center gap-2 mb-4">
               <span className="text-xs text-slate-400 font-bold">Ciclo Geral:</span>
-              {["VERDE", "AMARELA", "AZUL"].map(colorName => {
+              {EQUIPES_PRONTIDAO.map(colorName => {
                 const isCurrent = activeProntidao.name === colorName;
                 return (
                   <span
@@ -748,7 +716,7 @@ export default function Dashboard({
                     <p className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">{post.conteudo}</p>
                     <div className="flex justify-between items-center text-[9px] text-slate-400 font-bold mt-2 pt-1 border-t border-slate-100">
                       <span>RESPONSÁVEL: {post.bombeiro_re || "Sede 1º GB"}</span>
-                      <span>{new Date(post.criado_em).toLocaleDateString("pt-BR")}</span>
+                      <span>{formatDateBR(new Date(post.criado_em))}</span>
                     </div>
                   </div>
                 ))

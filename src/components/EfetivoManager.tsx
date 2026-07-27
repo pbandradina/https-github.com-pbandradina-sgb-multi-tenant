@@ -4,6 +4,9 @@ import {
   MapPin, Check, UserPlus, X, Shield, Star 
 } from "lucide-react";
 import { Bombeiro, Quartel } from "../types";
+import { formatDateBR, todayKey } from "../lib/dates";
+import { POSTOS_GRADUACOES } from "../lib/escalas";
+import { EQUIPES_PRONTIDAO } from "../lib/prontidao";
 
 interface EfetivoManagerProps {
   selectedQuartelId: string;
@@ -33,26 +36,11 @@ export default function EfetivoManager({
   const [formStatus, setFormStatus] = useState("Ativo");
   const [formTelefone, setFormTelefone] = useState("");
   const [formEspecialidades, setFormEspecialidades] = useState("");
-  const [formDataInicioServico, setFormDataInicioServico] = useState(() => {
-    return new Date().toISOString().split("T")[0];
-  });
+  const [formDataInicioServico, setFormDataInicioServico] = useState(todayKey);
   const [formRegime, setFormRegime] = useState("PRONTIDÃO");
   const [formEquipe, setFormEquipe] = useState("VERDE");
   const [isSubmitLoading, setIsSubmitLoading] = useState(false);
   const [showAddForm, setShowAddForm] = useState(false);
-
-  // Brazilian fire station ranks
-  const postosGraduacoes = [
-    "Soldado",
-    "Cabo",
-    "3º Sargento",
-    "2º Sargento",
-    "1º Sargento",
-    "Subtenente",
-    "2º Tenente",
-    "1º Tenente",
-    "Capitão"
-  ];
 
   const activeQuartel = quarteis.find(q => q.id === selectedQuartelId);
   
@@ -88,7 +76,7 @@ export default function EfetivoManager({
         status: formStatus,
         telefone: formTelefone,
         especialidades: formEspecialidades,
-        data_inicio_servico: formDataInicioServico || new Date().toISOString().split("T")[0],
+        data_inicio_servico: formDataInicioServico || todayKey(),
         regime: formRegime,
         equipe: formRegime === "PRONTIDÃO" ? formEquipe : ""
       });
@@ -101,7 +89,7 @@ export default function EfetivoManager({
       setFormStatus("Ativo");
       setFormTelefone("");
       setFormEspecialidades("");
-      setFormDataInicioServico(new Date().toISOString().split("T")[0]);
+      setFormDataInicioServico(todayKey());
       setFormRegime("PRONTIDÃO");
       setFormEquipe("VERDE");
       setShowAddForm(false);
@@ -195,7 +183,7 @@ export default function EfetivoManager({
                 value={formPostoGrad}
                 onChange={(e) => setFormPostoGrad(e.target.value)}
               >
-                {postosGraduacoes.map((posto, i) => (
+                {POSTOS_GRADUACOES.map((posto, i) => (
                   <option key={i} value={posto}>{posto}</option>
                 ))}
               </select>
@@ -256,9 +244,9 @@ export default function EfetivoManager({
                   value={formEquipe}
                   onChange={(e) => setFormEquipe(e.target.value)}
                 >
-                  <option value="VERDE">VERDE</option>
-                  <option value="AMARELA">AMARELA</option>
-                  <option value="AZUL">AZUL</option>
+                  {EQUIPES_PRONTIDAO.map(equipe => (
+                    <option key={equipe} value={equipe}>{equipe}</option>
+                  ))}
                 </select>
               </div>
             )}
@@ -397,7 +385,7 @@ export default function EfetivoManager({
                     {/* Início de Serviço */}
                     <div className="flex items-center gap-2 text-slate-500 text-[11px] font-mono leading-none">
                       <Shield className="w-3.5 h-3.5 text-blue-500" />
-                      <span>Inc. Serviço: {bombeiro.data_inicio_servico ? new Date(bombeiro.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR") : "Não preenchido"}</span>
+                      <span>Inc. Serviço: {bombeiro.data_inicio_servico ? formatDateBR(bombeiro.data_inicio_servico) : "Não preenchido"}</span>
                     </div>
 
                     {/* Telephone */}
