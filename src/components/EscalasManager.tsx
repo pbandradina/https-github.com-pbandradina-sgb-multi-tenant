@@ -4,6 +4,15 @@ import {
   MapPin, CheckCircle, FileText, ChevronDown, Download 
 } from "lucide-react";
 import { Bombeiro, Escala, Quartel, Afastamento, Fmo } from "../types";
+import {
+  FUNCOES_SP,
+  filterEscalas,
+  formatDateBr,
+  getDatesWithEscalasDesc,
+  groupEscalasByDate,
+  isBeforeAdmissao
+} from "../lib/escalas";
+import { findAfastamentoOnDate, findFmoOnDate } from "../lib/frequencia";
 
 interface EscalasManagerProps {
   selectedQuartelId: string;
@@ -41,35 +50,17 @@ export default function EscalasManager({
   const activeBombeiros = bombeiros.filter(b => b.quartel_id === selectedQuartelId);
 
   // Filter scales for the active department
-  const activeEscalas = escalas.filter(
-    e => e.quartel_id === selectedQuartelId && (!filterDate || e.data === filterDate)
-  );
+  const activeEscalas = filterEscalas(escalas, selectedQuartelId, filterDate);
 
   // Form selections dropdown list of official fire roles in SP
-  const funcoesSP = [
-    "Chefe de Guarnição / Comandante do Posto",
-    "Motorista de Emergência (ABS - Auto Bomba)",
-    "Motorista de Resgate (UR - Unidade de Resgate)",
-    "Socorrista Resgatista (Auxiliar UR)",
-    "Auxiliar de Bomba & Linha de Combate",
-    "Condutor da Escada Mecânica (AEM)",
-    "Telefonista / Despachante de Chamadas",
-    "Sentinela / Guarda de Portão",
-    "Auxiliar de Salvamento Terrestre"
-  ];
+  const funcoesSP = FUNCOES_SP;
 
   const handleAddEscala = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formBombeiroId) return;
 
     // 1. Verificar se o militar está afastado na data escolhida
-    const chosenDate = new Date(formDate + "T00:00:00");
-    const targetAfastamento = afastamentos.find(af => {
-      if (af.bombeiro_id !== formBombeiroId) return false;
-      const dStart = new Date(af.data_inicio + "T00:00:00");
-      const dEnd = new Date(af.data_fim + "T00:00:00");
-      return (chosenDate >= dStart && chosenDate <= dEnd);
-    });
+    const targetAfastamento = findAfastamentoOnDate(afastamentos, formBombeiroId, formDate);
 
     const militarObj = bombeiros.find(b => b.id === formBombeiroId);
 
@@ -81,7 +72,7 @@ export default function EscalasManager({
     }
 
     // 2. Verificar se o militar possui FMO na data da escala
-    const targetFmo = fmos.find(f => f.bombeiro_id === formBombeiroId && f.data === formDate);
+    const targetFmo = findFmoOnDate(fmos, formBombeiroId, formDate);
     if (targetFmo) {
       const proce = confirm(
         `CONFLITO COM FMO (Folga Mensal Obrigatória):\nO dia ${formDate} é reservado para a Folga Obrigatória (FMO) do militar ${militarObj?.nome_guerra}.\n\nDeseja anular a folga em escala e forçar o serviço operacional dele neste dia?`
@@ -90,14 +81,12 @@ export default function EscalasManager({
     }
 
     // 3. Verificar início do serviço ativo (Data de Admissão)
-    if (militarObj && militarObj.data_inicio_servico) {
-      if (formDate < militarObj.data_inicio_servico) {
-        const formattedDate = new Date(militarObj.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
-        alert(
-          `ERRO DE COERÊNCIA CRONOLÓGICA:\nO militar ${militarObj.nome_guerra} iniciou o serviço ativo em ${formattedDate}.\n\nNão é permitido escalar serviços ou plantões para datas anteriores à data de início do serviço.`
-        );
-        return;
-      }
+    if (isBeforeAdmissao(militarObj, formDate)) {
+      const formattedDate = formatDateBr(militarObj!.data_inicio_servico!);
+      alert(
+        `ERRO DE COERÊNCIA CRONOLÓGICA:\nO militar ${militarObj!.nome_guerra} iniciou o serviço ativo em ${formattedDate}.\n\nNão é permitido escalar serviços ou plantões para datas anteriores à data de início do serviço.`
+      );
+      return;
     }
 
     setIsSubmitLoading(true);
@@ -124,14 +113,9 @@ export default function EscalasManager({
   };
 
   // Group scales by date for the PDF roster preview
-  const groupedEscalasByDate = activeEscalas.reduce((groups: Record<string, Escala[]>, escala) => {
-    const key = escala.data;
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(escala);
-    return groups;
-  }, {});
+  const groupedEscalasByDate = groupEscalasByDate(activeEscalas);
 
-  const datesWithEscalas = Object.keys(groupedEscalasByDate).sort().reverse();
+  const datesWithEscalas = getDatesWithEscalasDesc(groupedEscalasByDate);
 
   return (
     <div className="space-y-6">
@@ -186,14 +170,8 @@ export default function EscalasManager({
                 >
                   <option value="">-- Selecione do Efetivo Militar --</option>
                   {activeBombeiros.map(b => {
-                    const isAfastado = afastamentos.find(af => {
-                      if (af.bombeiro_id !== b.id) return false;
-                      const dStart = new Date(af.data_inicio + "T00:00:00");
-                      const dEnd = new Date(af.data_fim + "T00:00:00");
-                      const chosenDate = new Date(formDate + "T00:00:00");
-                      return (chosenDate >= dStart && chosenDate <= dEnd);
-                    });
-                    const hasFmo = fmos.find(f => f.bombeiro_id === b.id && f.data === formDate);
+                    const isAfastado = findAfastamentoOnDate(afastamentos, b.id, formDate);
+                    const hasFmo = findFmoOnDate(fmos, b.id, formDate);
                     
                     let suffix = "";
                     if (isAfastado) suffix = ` - [🏥 AFASTADO: ${isAfastado.tipo.toUpperCase()}]`;

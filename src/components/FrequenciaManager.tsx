@@ -6,6 +6,16 @@ import {
   ChevronLeft, ChevronRight
 } from "lucide-react";
 import { Bombeiro, Escala, Quartel, Afastamento, Fmo } from "../types";
+import { MESES, buildMonthGrid, getDaysInMonth, getFirstDayOfMonth, getNextMonth, getPreviousMonth } from "../lib/dates";
+import { getProntidaoDoDiaStr as getEquipeDoDia } from "../lib/prontidao";
+import {
+  computeFolhaFrequencia,
+  computeTotaisFrequencia,
+  detectConflitosEscala,
+  findAfastamentoOnDate,
+  findFmoOnDate
+} from "../lib/frequencia";
+import { findEscalaOnDate, findEscalasNoPeriodo, formatDateBr, isBeforeAdmissao, isPeriodoInvalido } from "../lib/escalas";
 
 interface FrequenciaManagerProps {
   selectedQuartelId: string;
@@ -91,219 +101,65 @@ export default function FrequenciaManager({
   const stationFmos = fmos.filter(f => f.quartel_id === selectedQuartelId);
 
   // Month options
-  const meses = [
-    { value: 1, label: "Janeiro" },
-    { value: 2, label: "Fevereiro" },
-    { value: 3, label: "Março" },
-    { value: 4, label: "Abril" },
-    { value: 5, label: "Maio" },
-    { value: 6, label: "Junho" },
-    { value: 7, label: "Julho" },
-    { value: 8, label: "Agosto" },
-    { value: 9, label: "Setembro" },
-    { value: 10, label: "Outubro" },
-    { value: 11, label: "Novembro" },
-    { value: 12, label: "Dezembro" }
-  ];
+  const meses = MESES;
 
-  // Check if a date string falls inside an absence period for a firefighter
-  const checkIfMilitarAfastadoOnDate = (militarId: string, dateStr: string) => {
-    const targetDate = new Date(dateStr + "T00:00:00");
-    const mAbsences = stationAfastamentos.filter(a => a.bombeiro_id === militarId);
-    
-    for (const ab of mAbsences) {
-      const dStart = new Date(ab.data_inicio + "T00:00:00");
-      const dEnd = new Date(ab.data_fim + "T00:00:00");
-      if (targetDate >= dStart && targetDate <= dEnd) {
-        return ab;
-      }
-    }
-    return null;
-  };
+  const checkIfMilitarAfastadoOnDate = (militarId: string, dateStr: string) =>
+    findAfastamentoOnDate(stationAfastamentos, militarId, dateStr);
 
-  // Check if a militar has a programmed FMO on a specific date
-  const checkIfMilitarHasFmoOnDate = (militarId: string, dateStr: string) => {
-    return stationFmos.find(f => f.bombeiro_id === militarId && f.data === dateStr);
-  };
+  const checkIfMilitarHasFmoOnDate = (militarId: string, dateStr: string) =>
+    findFmoOnDate(stationFmos, militarId, dateStr);
 
   // Relação de conflitos pré-existentes na base para segurança operacional
-  const activeConflicts: Array<{ militar: string; data: string; descricao: string; tipo: "afastamento" | "fmo" }> = [];
-
-  stationEscalas.forEach(escala => {
-    const militar = activeBombeiros.find(b => b.id === escala.bombeiro_id);
-    if (!militar) return;
-
-    // Conflito de Afastamento
-    const abs = checkIfMilitarAfastadoOnDate(militar.id, escala.data);
-    if (abs) {
-      activeConflicts.push({
-        militar: militar.nome_guerra,
-        data: escala.data,
-        descricao: `Escalado no período de ${abs.tipo} G.B. (${abs.data_inicio} a ${abs.data_fim})`,
-        tipo: "afastamento"
-      });
-    }
-
-    // Conflito de FMO
-    const fmoCol = checkIfMilitarHasFmoOnDate(militar.id, escala.data);
-    if (fmoCol) {
-      activeConflicts.push({
-        militar: militar.nome_guerra,
-        data: escala.data,
-        descricao: `Plantonista escalado em data reservada como FMO (Folga Obrigatória)`,
-        tipo: "fmo"
-      });
-    }
-  });
+  const activeConflicts = detectConflitosEscala(stationEscalas, activeBombeiros, stationAfastamentos, stationFmos);
 
   // Compiled Statistics per firefighter with full respect to schedules, FMO, and leave days
-  const folhaFrequencia = activeBombeiros.filter(b => (b.regime || "PRONTIDÃO") !== "EXPEDIENTE").map((bombeiro) => {
-    // Find actual attendances scale shifts this month
-    const plantoesMes = stationEscalas.filter(escala => {
-      if (escala.bombeiro_id !== bombeiro.id) return false;
-      const dataEscala = new Date(escala.data + "T00:00:00");
-      return (dataEscala.getMonth() + 1) === selectedMonth && dataEscala.getFullYear() === selectedYear;
-    });
-
-    // Absences that fall in this month
-    const afastamentosNoMes = stationAfastamentos.filter(ab => {
-      if (ab.bombeiro_id !== bombeiro.id) return false;
-      const dStart = new Date(ab.data_inicio + "T00:00:00");
-      const dEnd = new Date(ab.data_fim + "T00:00:00");
-      
-      // Check if overlapping selected month/year
-      const startMonthLimit = new Date(selectedYear, selectedMonth - 1, 1);
-      const endMonthLimit = new Date(selectedYear, selectedMonth, 0);
-
-      return (dStart <= endMonthLimit && dEnd >= startMonthLimit);
-    });
-
-    // FMOs generated in this month
-    const fmosNoMes = stationFmos.filter(f => {
-      if (f.bombeiro_id !== bombeiro.id) return false;
-      const dFmo = new Date(f.data + "T00:00:00");
-      return (dFmo.getMonth() + 1) === selectedMonth && dFmo.getFullYear() === selectedYear;
-    });
-
-    // Compute active hours of operational duty
-    let horasTrabalhadas = 0;
-    let horasNoturnas = 0;
-    let plantoesContagem = 0;
-
-    plantoesMes.forEach(p => {
-      // Check if he was on absence on shift day (invalidates presence counts)
-      const absInDay = checkIfMilitarAfastadoOnDate(bombeiro.id, p.data);
-      if (absInDay) return; // Skip work count since he was absent/on leave
-
-      plantoesContagem++;
-      if (p.periodo === "24h") {
-        horasTrabalhadas += 24;
-        horasNoturnas += 7;
-      } else if (p.periodo === "Noturno 12h") {
-        horasTrabalhadas += 12;
-        horasNoturnas += 7;
-      } else if (p.periodo === "Diurno 12h") {
-        horasTrabalhadas += 12;
-      } else {
-        horasTrabalhadas += 12;
-      }
-    });
-
-    // Extra hours above 160h standard month duty
-    const limiteHorasMes = 160;
-    const horasExcedentes = Math.max(0, horasTrabalhadas - limiteHorasMes);
-
-    // Deduções de Afastamento
-    const diasAfastadosMesValue = afastamentosNoMes.reduce((acc, current) => {
-      const dS = new Date(current.data_inicio + "T00:00:00");
-      const dE = new Date(current.data_fim + "T00:00:00");
-      const diffTime = Math.abs(dE.getTime() - dS.getTime());
-      return acc + Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-    }, 0);
-
-    return {
-      bombeiro,
-      plantoesMes,
-      plantoesContagem,
-      horasTrabalhadas,
-      horasNoturnas,
-      horasExcedentes,
-      afastamentosNoMes,
-      fmosNoMes,
-      diasAfastados: diasAfastadosMesValue
-    };
-  }).filter(item => {
-    const lower = searchTerm.toLowerCase();
-    return (
-      item.bombeiro.nome.toLowerCase().includes(lower) ||
-      item.bombeiro.nome_guerra.toLowerCase().includes(lower) ||
-      item.bombeiro.re.toLowerCase().includes(lower) ||
-      item.bombeiro.posto_grad.toLowerCase().includes(lower)
-    );
-  });
+  const folhaFrequencia = computeFolhaFrequencia(
+    activeBombeiros,
+    stationEscalas,
+    stationAfastamentos,
+    stationFmos,
+    selectedMonth,
+    selectedYear,
+    searchTerm
+  );
 
   // Globals (Focused on pure operational statistics)
-  const totalHorasGeraisDedicadas = folhaFrequencia.reduce((sum, item) => sum + item.horasTrabalhadas, 0);
-  const totalHorasNoturnasGerais = folhaFrequencia.reduce((sum, item) => sum + item.horasNoturnas, 0);
-  const totalHorasExcedentesGerais = folhaFrequencia.reduce((sum, item) => sum + item.horasExcedentes, 0);
-  const totalPlantoesGerais = folhaFrequencia.reduce((sum, item) => sum + item.plantoesContagem, 0);
-  const totalFmosGerais = folhaFrequencia.reduce((sum, item) => sum + item.fmosNoMes.length, 0);
-  const totalDiasAfastadosGerais = folhaFrequencia.reduce((sum, item) => sum + item.diasAfastados, 0);
+  const {
+    totalHorasGeraisDedicadas,
+    totalHorasNoturnasGerais,
+    totalHorasExcedentesGerais,
+    totalPlantoesGerais,
+    totalFmosGerais,
+    totalDiasAfastadosGerais
+  } = computeTotaisFrequencia(folhaFrequencia);
 
-  // Interactive calendar calculations
-  const getDaysInMonth = (month: number, year: number) => {
-    return new Date(year, month, 0).getDate();
-  };
-  const getFirstDayOfMonth = (month: number, year: number) => {
-    return new Date(year, month - 1, 1).getDay(); // 0 = Dom, 1 = Seg ...
+  const prontidaoStyles: Record<string, { name: string; text: string; bg: string; border: string }> = {
+    VERDE: { name: "VERDE", text: "text-emerald-400 bg-emerald-500/10 border-emerald-500/35", bg: "bg-emerald-600", border: "border-emerald-500" },
+    AMARELA: { name: "AMARELA", text: "text-amber-400 bg-amber-500/10 border-amber-500/35", bg: "bg-yellow-500", border: "border-yellow-500" },
+    AZUL: { name: "AZUL", text: "text-blue-400 bg-blue-500/10 border-blue-500/30", bg: "bg-blue-600", border: "border-blue-500" }
   };
 
   const getProntidaoDoDiaStr = (dateStr: string) => {
-    if (!dateStr) return { name: "", text: "border-transparent text-slate-500", bg: "", border: "" };
-    const d = new Date(dateStr + "T12:00:00");
-    const reference = new Date(2026, 0, 1).getTime();
-    const target = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-    const diffDays = Math.round((target - reference) / (1000 * 60 * 60 * 24));
-    const idx = ((diffDays % 3) + 3) % 3;
-    const choices = [
-      { name: "VERDE", text: "text-emerald-400 bg-emerald-500/10 border-emerald-500/35", bg: "bg-emerald-600", border: "border-emerald-500" },
-      { name: "AMARELA", text: "text-amber-400 bg-amber-500/10 border-amber-500/35", bg: "bg-yellow-500", border: "border-yellow-500" },
-      { name: "AZUL", text: "text-blue-400 bg-blue-500/10 border-blue-500/30", bg: "bg-blue-600", border: "border-blue-500" }
-    ];
-    return choices[idx];
+    const equipe = getEquipeDoDia(dateStr);
+    if (!equipe) return { name: "", text: "border-transparent text-slate-500", bg: "", border: "" };
+    return prontidaoStyles[equipe];
   };
 
   const handlePrevMonth = () => {
-    if (selectedMonth === 1) {
-      setSelectedMonth(12);
-      setSelectedYear(prev => prev - 1);
-    } else {
-      setSelectedMonth(selectedMonth - 1);
-    }
+    const previous = getPreviousMonth(selectedMonth, selectedYear);
+    setSelectedMonth(previous.month);
+    setSelectedYear(previous.year);
   };
 
   const handleNextMonth = () => {
-    if (selectedMonth === 12) {
-      setSelectedMonth(1);
-      setSelectedYear(prev => prev + 1);
-    } else {
-      setSelectedMonth(selectedMonth + 1);
-    }
+    const next = getNextMonth(selectedMonth, selectedYear);
+    setSelectedMonth(next.month);
+    setSelectedYear(next.year);
   };
 
   const daysInMonth = getDaysInMonth(selectedMonth, selectedYear);
   const startDayOfWeek = getFirstDayOfMonth(selectedMonth, selectedYear);
-
-  const daysGrid: Array<{ dateStr: string; dayNum: number | null }> = [];
-  // Dummy empty spaces
-  for (let i = 0; i < startDayOfWeek; i++) {
-    daysGrid.push({ dateStr: "", dayNum: null });
-  }
-  // Days of month
-  for (let d = 1; d <= daysInMonth; d++) {
-    const dStr = `${selectedYear}-${String(selectedMonth).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
-    daysGrid.push({ dateStr: dStr, dayNum: d });
-  }
+  const daysGrid = buildMonthGrid(selectedMonth, selectedYear);
 
   // Handle addition of Afastamento
   const handleCreateAfastamento = async (e: React.FormEvent) => {
@@ -316,21 +172,14 @@ export default function FrequenciaManager({
       return;
     }
 
-    const dS = new Date(afInicio + "T00:00:00");
-    const dE = new Date(afFim + "T00:00:00");
-
-    if (dE < dS) {
+    if (isPeriodoInvalido(afInicio, afFim)) {
       setAfFormError("A data de término do afastamento não pode ser anterior à data de início.");
       return;
     }
 
     // Safety checks for pre-existing scheduled duty scales in specified period
     const mil = activeBombeiros.find(b => b.id === afMilitarId);
-    const scaleCollisions = stationEscalas.filter(esc => {
-      if (esc.bombeiro_id !== afMilitarId) return false;
-      const dEsc = new Date(esc.data + "T00:00:00");
-      return (dEsc >= dS && dEsc <= dE);
-    });
+    const scaleCollisions = findEscalasNoPeriodo(stationEscalas, afMilitarId, afInicio, afFim);
 
     let autoJust = afJustificativa;
     if (scaleCollisions.length > 0) {
@@ -372,16 +221,14 @@ export default function FrequenciaManager({
     }
 
     const mil = activeBombeiros.find(b => b.id === fmoMilitarId);
-    if (mil && mil.data_inicio_servico) {
-      if (fmoData < mil.data_inicio_servico) {
-        const formattedDate = new Date(mil.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
-        setFmoFormError(`Impossível homologar FMO neste dia: o militar iniciou o serviço ativo em ${formattedDate}. Por favor, escolha uma data igual ou posterior.`);
-        return;
-      }
+    if (isBeforeAdmissao(mil, fmoData)) {
+      const formattedDate = formatDateBr(mil!.data_inicio_servico!);
+      setFmoFormError(`Impossível homologar FMO neste dia: o militar iniciou o serviço ativo em ${formattedDate}. Por favor, escolha uma data igual ou posterior.`);
+      return;
     }
 
     // Validation: check scale on exact same day
-    const scaleCollision = stationEscalas.find(esc => esc.bombeiro_id === fmoMilitarId && esc.data === fmoData);
+    const scaleCollision = findEscalaOnDate(stationEscalas, fmoMilitarId, fmoData);
     let autoJust = fmoJustificativa;
 
     if (scaleCollision) {
@@ -435,8 +282,8 @@ export default function FrequenciaManager({
         }
 
         // Check if chronological consistency is met (not before admission date)
-        if (milObj && milObj.data_inicio_servico && targetDate < milObj.data_inicio_servico) {
-          const formattedDate = new Date(milObj.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
+        if (isBeforeAdmissao(milObj, targetDate)) {
+          const formattedDate = formatDateBr(milObj!.data_inicio_servico!);
           setModalError(`Erro: Militar ${milObj?.nome_guerra} iniciou serviço em ${formattedDate}. Impossível programar serviço em data anterior.`);
           setModalLoading(false);
           return;
@@ -462,14 +309,14 @@ export default function FrequenciaManager({
           periodo: modalEscalaPeriodo
         });
       } else if (modalSelection === "fmo") {
-        if (milObj && milObj.data_inicio_servico && targetDate < milObj.data_inicio_servico) {
-          const formattedDate = new Date(milObj.data_inicio_servico + "T00:00:00").toLocaleDateString("pt-BR");
+        if (isBeforeAdmissao(milObj, targetDate)) {
+          const formattedDate = formatDateBr(milObj!.data_inicio_servico!);
           setModalError(`Erro: Militar ${milObj?.nome_guerra} iniciou o serviço ativo em ${formattedDate}. Escolha data igual ou posterior.`);
           setModalLoading(false);
           return;
         }
 
-        const hasEscala = stationEscalas.find(es => es.bombeiro_id === targetBId && es.data === targetDate);
+        const hasEscala = findEscalaOnDate(stationEscalas, targetBId, targetDate);
         if (hasEscala) {
           const proceed = confirm(`CONFLITO: ${milObj?.nome_guerra} possui escala de plantão nesta data. Marcar FMO irá gerar inconsistência. Deseja prosseguir de qualquer forma?`);
           if (!proceed) { setModalLoading(false); return; }

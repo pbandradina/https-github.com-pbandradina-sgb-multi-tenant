@@ -4,6 +4,8 @@ import {
   MapPin, Check, UserPlus, X, Shield, Star 
 } from "lucide-react";
 import { Bombeiro, Quartel } from "../types";
+import { POSTOS_GRADUACOES, filterBombeiros, getEquipeCadastro } from "../lib/efetivo";
+import { formatDate } from "../lib/dates";
 
 interface EfetivoManagerProps {
   selectedQuartelId: string;
@@ -33,45 +35,19 @@ export default function EfetivoManager({
   const [formStatus, setFormStatus] = useState("Ativo");
   const [formTelefone, setFormTelefone] = useState("");
   const [formEspecialidades, setFormEspecialidades] = useState("");
-  const [formDataInicioServico, setFormDataInicioServico] = useState(() => {
-    return new Date().toISOString().split("T")[0];
-  });
+  const [formDataInicioServico, setFormDataInicioServico] = useState(() => formatDate(new Date()));
   const [formRegime, setFormRegime] = useState("PRONTIDÃO");
   const [formEquipe, setFormEquipe] = useState("VERDE");
   const [isSubmitLoading, setIsSubmitLoading] = useState(false);
   const [showAddForm, setShowAddForm] = useState(false);
 
   // Brazilian fire station ranks
-  const postosGraduacoes = [
-    "Soldado",
-    "Cabo",
-    "3º Sargento",
-    "2º Sargento",
-    "1º Sargento",
-    "Subtenente",
-    "2º Tenente",
-    "1º Tenente",
-    "Capitão"
-  ];
+  const postosGraduacoes = POSTOS_GRADUACOES;
 
   const activeQuartel = quarteis.find(q => q.id === selectedQuartelId);
-  
+
   // Filter firefighters belonging to active station, search query and status filter
-  const filteredBombeiros = bombeiros.filter(b => {
-    if (b.quartel_id !== selectedQuartelId) return false;
-    
-    // Status filter
-    if (statusFilter !== "Todos" && b.status !== statusFilter) return false;
-
-    // Search query
-    const matchSearch = 
-      b.nome.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      b.nome_guerra.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      b.re.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (b.especialidades && b.especialidades.toLowerCase().includes(searchTerm.toLowerCase()));
-
-    return matchSearch;
-  });
+  const filteredBombeiros = filterBombeiros(bombeiros, selectedQuartelId, statusFilter, searchTerm);
 
   const handleAddBombeiro = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -88,9 +64,9 @@ export default function EfetivoManager({
         status: formStatus,
         telefone: formTelefone,
         especialidades: formEspecialidades,
-        data_inicio_servico: formDataInicioServico || new Date().toISOString().split("T")[0],
+        data_inicio_servico: formDataInicioServico || formatDate(new Date()),
         regime: formRegime,
-        equipe: formRegime === "PRONTIDÃO" ? formEquipe : ""
+        equipe: getEquipeCadastro(formRegime, formEquipe)
       });
 
       // Reset form
@@ -101,7 +77,7 @@ export default function EfetivoManager({
       setFormStatus("Ativo");
       setFormTelefone("");
       setFormEspecialidades("");
-      setFormDataInicioServico(new Date().toISOString().split("T")[0]);
+      setFormDataInicioServico(formatDate(new Date()));
       setFormRegime("PRONTIDÃO");
       setFormEquipe("VERDE");
       setShowAddForm(false);

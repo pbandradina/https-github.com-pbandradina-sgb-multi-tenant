@@ -5,10 +5,9 @@ import {
   MessageSquare, UserCheck, ChevronRight, ChevronLeft, Calendar
 } from "lucide-react";
 import { Bombeiro, Escala, Viatura, Ocorrencia, MuralPost, Afastamento, Fmo } from "../types";
-
-const formatDate = (d: Date | string) => {
-  return new Date(d).toISOString().split("T")[0];
-};
+import { formatDate, isDateInMonth } from "../lib/dates";
+import { getProntidaoIndex } from "../lib/prontidao";
+import { getHorasPeriodo } from "../lib/frequencia";
 
 interface DashboardProps {
   selectedQuartelId: string;
@@ -69,16 +68,12 @@ export default function Dashboard({
   };
 
   const getProntidaoDoDia = (date: Date) => {
-    const reference = new Date(2026, 0, 1).getTime();
-    const target = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-    const diffDays = Math.round((target - reference) / (1000 * 60 * 60 * 24));
-    const idx = ((diffDays % 3) + 3) % 3;
     const choices = [
       { name: "VERDE", color: "bg-emerald-600", border: "border-emerald-500/30", text: "text-emerald-500", bg: "bg-emerald-50 text-emerald-800 border-emerald-100" },
       { name: "AMARELA", color: "bg-yellow-500", border: "border-yellow-500/30", text: "text-yellow-600", bg: "bg-yellow-50 text-yellow-800 border-yellow-100" },
       { name: "AZUL", color: "bg-blue-600", border: "border-blue-500/30", text: "text-blue-500", bg: "bg-blue-50 text-blue-800 border-blue-100" }
     ];
-    return choices[idx];
+    return choices[getProntidaoIndex(date)];
   };
 
   const activeProntidao = getProntidaoDoDia(dashboardDate);
@@ -99,12 +94,9 @@ export default function Dashboard({
   const currentMonth = new Date().getMonth() + 1;
   const currentYear = 2026; // Match state years
 
-  const escalasMes = escalas.filter(e => {
-    if (e.quartel_id !== selectedQuartelId) return false;
-    const dStr = e.data; // "YYYY-MM-DD"
-    const d = new Date(dStr + "T00:00:00");
-    return (d.getMonth() + 1) === currentMonth && d.getFullYear() === currentYear;
-  });
+  const escalasMes = escalas.filter(
+    e => e.quartel_id === selectedQuartelId && isDateInMonth(e.data, currentMonth, currentYear)
+  );
 
   let totalHorasTrabalhadasMes = 0;
   let totalPlantoesMes = 0;
@@ -114,15 +106,7 @@ export default function Dashboard({
     if (!bombeiro) return;
 
     totalPlantoesMes++;
-    if (p.periodo === "24h") {
-      totalHorasTrabalhadasMes += 24;
-    } else if (p.periodo === "Noturno 12h") {
-      totalHorasTrabalhadasMes += 12;
-    } else if (p.periodo === "Diurno 12h") {
-      totalHorasTrabalhadasMes += 12;
-    } else {
-      totalHorasTrabalhadasMes += 12;
-    }
+    totalHorasTrabalhadasMes += getHorasPeriodo(p.periodo).horas;
   });
 
   const stats = {
