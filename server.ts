@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
@@ -9,13 +10,13 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.disable("x-powered-by");
+app.use(express.json({ limit: "100kb" }));
 
 const dbUrl = process.env.SUPABASE_DB_URL;
 
 let pool: pg.Pool | null = null;
 let isDbConnected = false;
-let dbConnectionStringRef = "";
 
 // Graceful Mock Fallback Data (In-Memory database) to guarantee flawless reliability
 let mockQuarteis = [
@@ -88,9 +89,165 @@ let mockFmos = [
   { id: "fmo_2", quartel_id: "q1", bombeiro_id: "b5", data: "2026-05-25", justificativa: "Folga Escala PMESP" }
 ];
 
-let mockAdmins = [
-  { username: "admin", nome: "Administrador 20º GB", password: "sgb20gb" }
-];
+// --- SENHAS (scrypt com salt aleatório) ---
+const SCRYPT_KEYLEN = 64;
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(password, salt, SCRYPT_KEYLEN);
+  return `scrypt$${salt.toString("hex")}$${derived.toString("hex")}`;
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  if (typeof stored !== "string") return false;
+  const [scheme, saltHex, hashHex] = stored.split("$");
+  if (scheme !== "scrypt" || !saltHex || !hashHex) return false;
+  let expected: Buffer;
+  let actual: Buffer;
+  try {
+    expected = Buffer.from(hashHex, "hex");
+    actual = crypto.scryptSync(password, Buffer.from(saltHex, "hex"), expected.length);
+  } catch {
+    return false;
+  }
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function isHashedPassword(stored: unknown): boolean {
+  return typeof stored === "string" && stored.startsWith("scrypt$");
+}
+
+// A senha inicial vem do ambiente; sem ela uma senha aleatória é gerada e
+// exibida uma única vez no log do servidor.
+let defaultAdminPassword: string | null = null;
+
+function resolveDefaultAdminPassword(): string {
+  if (defaultAdminPassword) return defaultAdminPassword;
+  defaultAdminPassword = generateDefaultAdminPassword();
+  return defaultAdminPassword;
+}
+
+function generateDefaultAdminPassword(): string {
+  const fromEnv = process.env.ADMIN_DEFAULT_PASSWORD;
+  if (fromEnv && fromEnv.length >= 8) return fromEnv;
+  if (fromEnv) {
+    console.warn("ADMIN_DEFAULT_PASSWORD tem menos de 8 caracteres e foi ignorada.");
+  }
+  const generated = crypto.randomBytes(12).toString("base64url");
+  console.warn(`Senha inicial do administrador 'admin' gerada: ${generated}`);
+  console.warn("Defina ADMIN_DEFAULT_PASSWORD e troque esta senha após o primeiro acesso.");
+  return generated;
+}
+
+let mockAdmins: { username: string; nome: string; password: string }[] = [];
+
+function ensureMockAdmin() {
+  if (mockAdmins.length > 0) return;
+  mockAdmins.push({
+    username: "admin",
+    nome: "Administrador 20º GB",
+    password: hashPassword(resolveDefaultAdminPassword())
+  });
+  console.log("Administrador padrão ('admin') criado no modo Em Memória.");
+}
+
+// --- SESSÕES ADMINISTRATIVAS ---
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+
+type AdminIdentity = { username: string; nome: string };
+type AdminSession = AdminIdentity & { expiresAt: number };
+
+const sessions = new Map<string, AdminSession>();
+
+function createSession(admin: AdminIdentity): string {
+  const token = crypto.randomBytes(32).toString("hex");
+  sessions.set(token, { ...admin, expiresAt: Date.now() + SESSION_TTL_MS });
+  return token;
+}
+
+function readSession(req: express.Request): AdminSession | null {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer ")) return null;
+  const token = header.slice("Bearer ".length).trim();
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+  return session;
+}
+
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!readSession(req)) {
+    return res.status(401).json({ error: "Autenticação de administrador obrigatória." });
+  }
+  next();
+}
+
+// --- RATE LIMIT DO LOGIN ---
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 10;
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function isLoginRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || entry.resetAt < now) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > LOGIN_MAX_ATTEMPTS;
+}
+
+// --- VALIDAÇÃO DE ENTRADA ---
+const ID_PATTERN = /^[A-Za-z0-9_.-]{1,50}$/;
+
+function text(value: unknown, maxLen: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > maxLen) return undefined;
+  return trimmed;
+}
+
+function optionalText(value: unknown, maxLen: number): string | undefined {
+  if (value === undefined || value === null || value === "") return "";
+  return text(value, maxLen);
+}
+
+function identifier(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return ID_PATTERN.test(trimmed) ? trimmed : undefined;
+}
+
+function isoDate(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return undefined;
+  return parsed.toISOString().split("T")[0];
+}
+
+function isoTimestamp(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value !== "string") return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+}
+
+function badRequest(res: express.Response, field: string) {
+  return res.status(400).json({ error: `Campo inválido ou ausente: ${field}` });
+}
+
+function paramId(req: express.Request, res: express.Response): string | null {
+  const id = identifier(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: "Identificador inválido." });
+    return null;
+  }
+  return id;
+}
 
 // Iniciar conexão com Supabase Postgres
 async function initDb() {
@@ -101,15 +258,11 @@ async function initDb() {
     return false;
   }
 
-  // Mascarar dados de login para visualização em logs
-  const maskedConn = dbUrl.replace(/:([^:@]+)@/, ":*****@");
-  console.log("URL de Conexão:", maskedConn);
-  dbConnectionStringRef = maskedConn;
-
   try {
     pool = new pg.Pool({
       connectionString: dbUrl,
-      ssl: { rejectUnauthorized: false } // Supabase exige SSL
+      // Supabase exige SSL; a verificação do certificado só é desligada por opt-in explícito.
+      ssl: { rejectUnauthorized: process.env.DB_SSL_NO_VERIFY !== "true" }
     });
 
     // Testar conexão
@@ -236,8 +389,17 @@ async function initDb() {
       await pool.query(`
         INSERT INTO administradores (username, nome, password)
         VALUES ($1, $2, $3)
-      `, ["admin", "Administrador 20º GB", "sgb20gb"]);
-      console.log("Administrador padrão ('admin' / 'sgb20gb') semeado com sucesso.");
+      `, ["admin", "Administrador 20º GB", hashPassword(resolveDefaultAdminPassword())]);
+      console.log("Administrador padrão ('admin') semeado com sucesso.");
+    }
+
+    // Migrar senhas legadas armazenadas em texto puro
+    const storedAdmins = await pool.query("SELECT username, password FROM administradores");
+    for (const admin of storedAdmins.rows) {
+      if (!isHashedPassword(admin.password)) {
+        await pool.query("UPDATE administradores SET password = $1 WHERE username = $2", [hashPassword(admin.password), admin.username]);
+        console.log(`Senha do administrador '${admin.username}' migrada para hash scrypt.`);
+      }
     }
 
     // Se as tabelas estiverem totalmente vazias, popular com dados iniciais
@@ -284,7 +446,9 @@ async function initDb() {
   }
 }
 
-initDb();
+initDb().then((connected) => {
+  if (!connected) ensureMockAdmin();
+});
 
 // --- ENDPOINTS DA API ---
 
@@ -292,8 +456,7 @@ initDb();
 app.get("/api/status", (req, res) => {
   res.json({
     connected: isDbConnected,
-    database: "PostgreSQL - Supabase",
-    connectionString: dbConnectionStringRef || "In-Memory Fallback Client",
+    database: isDbConnected ? "PostgreSQL - Supabase" : "In-Memory Fallback",
     time: new Date().toISOString()
   });
 });
@@ -324,10 +487,35 @@ app.get("/api/bombeiros", async (req, res) => {
   res.json(mockBombeiros);
 });
 
-app.post("/api/bombeiros", async (req, res) => {
-  const { id, quartel_id, nome, nome_guerra, re, posto_grad, status, telefone, especialidades, data_inicio_servico, regime, equipe } = req.body;
-  const newId = id || "b_" + Date.now();
-  
+app.post("/api/bombeiros", requireAdmin, async (req, res) => {
+  const newId = req.body.id === undefined || req.body.id === null || req.body.id === ""
+    ? "b_" + Date.now()
+    : identifier(req.body.id);
+  if (!newId) return badRequest(res, "id");
+
+  const quartel_id = identifier(req.body.quartel_id);
+  if (!quartel_id) return badRequest(res, "quartel_id");
+  const nome = text(req.body.nome, 100);
+  if (!nome) return badRequest(res, "nome");
+  const nome_guerra = text(req.body.nome_guerra, 50);
+  if (!nome_guerra) return badRequest(res, "nome_guerra");
+  const re = text(req.body.re, 20);
+  if (!re) return badRequest(res, "re");
+  const posto_grad = text(req.body.posto_grad, 30);
+  if (!posto_grad) return badRequest(res, "posto_grad");
+  const status = optionalText(req.body.status, 20);
+  if (status === undefined) return badRequest(res, "status");
+  const telefone = optionalText(req.body.telefone, 20);
+  if (telefone === undefined) return badRequest(res, "telefone");
+  const especialidades = optionalText(req.body.especialidades, 500);
+  if (especialidades === undefined) return badRequest(res, "especialidades");
+  const data_inicio_servico = optionalText(req.body.data_inicio_servico, 20);
+  if (data_inicio_servico === undefined) return badRequest(res, "data_inicio_servico");
+  const regime = optionalText(req.body.regime, 30);
+  if (regime === undefined) return badRequest(res, "regime");
+  const equipe = optionalText(req.body.equipe, 30);
+  if (equipe === undefined) return badRequest(res, "equipe");
+
   if (isDbConnected && pool) {
     try {
       await pool.query(`
@@ -366,8 +554,9 @@ app.post("/api/bombeiros", async (req, res) => {
   res.json(data);
 });
 
-app.delete("/api/bombeiros/:id", async (req, res) => {
-  const { id } = req.params;
+app.delete("/api/bombeiros/:id", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
   if (isDbConnected && pool) {
     try {
       await pool.query("DELETE FROM bombeiros WHERE id = $1", [id]);
@@ -399,10 +588,22 @@ app.get("/api/escalas", async (req, res) => {
   res.json(mockEscalas);
 });
 
-app.post("/api/escalas", async (req, res) => {
-  const { id, quartel_id, data, bombeiro_id, funcao, periodo } = req.body;
-  const newId = id || "e_" + Date.now();
-  const rawDate = formatDate(data);
+app.post("/api/escalas", requireAdmin, async (req, res) => {
+  const newId = req.body.id === undefined || req.body.id === null || req.body.id === ""
+    ? "e_" + Date.now()
+    : identifier(req.body.id);
+  if (!newId) return badRequest(res, "id");
+
+  const quartel_id = identifier(req.body.quartel_id);
+  if (!quartel_id) return badRequest(res, "quartel_id");
+  const bombeiro_id = identifier(req.body.bombeiro_id);
+  if (!bombeiro_id) return badRequest(res, "bombeiro_id");
+  const funcao = text(req.body.funcao, 100);
+  if (!funcao) return badRequest(res, "funcao");
+  const periodo = text(req.body.periodo, 30);
+  if (!periodo) return badRequest(res, "periodo");
+  const rawDate = isoDate(req.body.data);
+  if (!rawDate) return badRequest(res, "data");
 
   if (isDbConnected && pool) {
     try {
@@ -434,8 +635,9 @@ app.post("/api/escalas", async (req, res) => {
   res.json(dataset);
 });
 
-app.delete("/api/escalas/:id", async (req, res) => {
-  const { id } = req.params;
+app.delete("/api/escalas/:id", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
   if (isDbConnected && pool) {
     try {
       await pool.query("DELETE FROM escalas WHERE id = $1", [id]);
@@ -462,9 +664,13 @@ app.get("/api/viaturas", async (req, res) => {
   res.json(mockViaturas);
 });
 
-app.put("/api/viaturas/:id", async (req, res) => {
-  const { id } = req.params;
-  const { status, escala_atual } = req.body;
+app.put("/api/viaturas/:id", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
+  const status = text(req.body.status, 30);
+  if (!status) return badRequest(res, "status");
+  const escala_atual = optionalText(req.body.escala_atual, 500);
+  if (escala_atual === undefined) return badRequest(res, "escala_atual");
 
   if (isDbConnected && pool) {
     try {
@@ -501,11 +707,34 @@ app.get("/api/ocorrencias", async (req, res) => {
   res.json(mockOcorrencias);
 });
 
-app.post("/api/ocorrencias", async (req, res) => {
-  const { id, quartel_id, tipo, endereco, viatura_id, status, historico, criado_em, fechado_em } = req.body;
-  const newId = id || "o_" + Date.now();
+app.post("/api/ocorrencias", requireAdmin, async (req, res) => {
+  const newId = req.body.id === undefined || req.body.id === null || req.body.id === ""
+    ? "o_" + Date.now()
+    : identifier(req.body.id);
+  if (!newId) return badRequest(res, "id");
+
+  const quartel_id = identifier(req.body.quartel_id);
+  if (!quartel_id) return badRequest(res, "quartel_id");
+  const tipo = text(req.body.tipo, 100);
+  if (!tipo) return badRequest(res, "tipo");
+  const endereco = text(req.body.endereco, 200);
+  if (!endereco) return badRequest(res, "endereco");
+  const viatura_id = req.body.viatura_id === undefined || req.body.viatura_id === null || req.body.viatura_id === ""
+    ? null
+    : identifier(req.body.viatura_id);
+  if (viatura_id === undefined) return badRequest(res, "viatura_id");
+  const status = optionalText(req.body.status, 20);
+  if (status === undefined) return badRequest(res, "status");
+  const historico = optionalText(req.body.historico, 5000);
+  if (historico === undefined) return badRequest(res, "historico");
+  const criadoEm = isoTimestamp(req.body.criado_em);
+  if (criadoEm === undefined) return badRequest(res, "criado_em");
+  const fechadoEm = isoTimestamp(req.body.fechado_em);
+  if (fechadoEm === undefined) return badRequest(res, "fechado_em");
+
+  const fechado_em = fechadoEm || null;
   const finalCode = "OCO-" + new Date().getFullYear() + "-" + Math.floor(100 + Math.random() * 900);
-  const startTime = criado_em || new Date().toISOString();
+  const startTime = criadoEm || new Date().toISOString();
 
   if (isDbConnected && pool) {
     try {
@@ -551,9 +780,11 @@ app.post("/api/ocorrencias", async (req, res) => {
   res.json(data);
 });
 
-app.put("/api/ocorrencias/:id/fechar", async (req, res) => {
-  const { id } = req.params;
-  const { historico } = req.body;
+app.put("/api/ocorrencias/:id/fechar", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
+  const historico = optionalText(req.body.historico, 5000);
+  if (historico === undefined) return badRequest(res, "historico");
   const now = new Date().toISOString();
 
   if (isDbConnected && pool) {
@@ -593,8 +824,15 @@ app.get("/api/mural", async (req, res) => {
   res.json(mockMural);
 });
 
-app.post("/api/mural", async (req, res) => {
-  const { title, content, authorRe, quartelId } = req.body;
+app.post("/api/mural", requireAdmin, async (req, res) => {
+  const title = text(req.body.title, 100);
+  if (!title) return badRequest(res, "title");
+  const content = text(req.body.content, 5000);
+  if (!content) return badRequest(res, "content");
+  const authorRe = optionalText(req.body.authorRe, 50);
+  if (authorRe === undefined) return badRequest(res, "authorRe");
+  const quartelId = identifier(req.body.quartelId);
+  if (!quartelId) return badRequest(res, "quartelId");
   const id = "m_" + Date.now();
   const timestamp = new Date().toISOString();
 
@@ -602,22 +840,23 @@ app.post("/api/mural", async (req, res) => {
     try {
       await pool.query(
         "INSERT INTO mural_avisos (id, quartel_id, titulo, conteudo, bombeiro_re, criado_em) VALUES ($1, $2, $3, $4, $5, $6)",
-        [id, quartelId || "q1", title, content, authorRe || "145.230-1", timestamp]
+        [id, quartelId, title, content, authorRe, timestamp]
       );
-      return res.json({ id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe, criado_em: timestamp });
+      return res.json({ id, quartel_id: quartelId, titulo: title, conteudo: content, bombeiro_re: authorRe, criado_em: timestamp });
     } catch (e) {
       console.error(e);
       return res.status(500).json({ error: "Erro ao registrar aviso" });
     }
   }
 
-  const post = { id, quartel_id: quartelId || "q1", titulo: title, conteudo: content, bombeiro_re: authorRe || "145.230-1", criado_em: timestamp };
+  const post = { id, quartel_id: quartelId, titulo: title, conteudo: content, bombeiro_re: authorRe, criado_em: timestamp };
   mockMural.unshift(post);
   res.json(post);
 });
 
-app.delete("/api/mural/:id", async (req, res) => {
-  const { id } = req.params;
+app.delete("/api/mural/:id", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
   if (isDbConnected && pool) {
     try {
       await pool.query("DELETE FROM mural_avisos WHERE id = $1", [id]);
@@ -649,11 +888,24 @@ app.get("/api/afastamentos", async (req, res) => {
   res.json(mockAfastamentos);
 });
 
-app.post("/api/afastamentos", async (req, res) => {
-  const { id, quartel_id, bombeiro_id, data_inicio, data_fim, tipo, justificativa } = req.body;
-  const newId = id || "af_" + Date.now();
-  const rawStart = formatDate(data_inicio);
-  const rawEnd = formatDate(data_fim);
+app.post("/api/afastamentos", requireAdmin, async (req, res) => {
+  const newId = req.body.id === undefined || req.body.id === null || req.body.id === ""
+    ? "af_" + Date.now()
+    : identifier(req.body.id);
+  if (!newId) return badRequest(res, "id");
+
+  const quartel_id = identifier(req.body.quartel_id);
+  if (!quartel_id) return badRequest(res, "quartel_id");
+  const bombeiro_id = identifier(req.body.bombeiro_id);
+  if (!bombeiro_id) return badRequest(res, "bombeiro_id");
+  const tipo = text(req.body.tipo, 50);
+  if (!tipo) return badRequest(res, "tipo");
+  const justificativa = optionalText(req.body.justificativa, 250);
+  if (justificativa === undefined) return badRequest(res, "justificativa");
+  const rawStart = isoDate(req.body.data_inicio);
+  if (!rawStart) return badRequest(res, "data_inicio");
+  const rawEnd = isoDate(req.body.data_fim);
+  if (!rawEnd) return badRequest(res, "data_fim");
 
   if (isDbConnected && pool) {
     try {
@@ -686,8 +938,9 @@ app.post("/api/afastamentos", async (req, res) => {
   res.json(dataset);
 });
 
-app.delete("/api/afastamentos/:id", async (req, res) => {
-  const { id } = req.params;
+app.delete("/api/afastamentos/:id", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
   if (isDbConnected && pool) {
     try {
       await pool.query("DELETE FROM afastamentos WHERE id = $1", [id]);
@@ -718,10 +971,20 @@ app.get("/api/fmos", async (req, res) => {
   res.json(mockFmos);
 });
 
-app.post("/api/fmos", async (req, res) => {
-  const { id, quartel_id, bombeiro_id, data, justificativa } = req.body;
-  const newId = id || "fmo_" + Date.now();
-  const rawDate = formatDate(data);
+app.post("/api/fmos", requireAdmin, async (req, res) => {
+  const newId = req.body.id === undefined || req.body.id === null || req.body.id === ""
+    ? "fmo_" + Date.now()
+    : identifier(req.body.id);
+  if (!newId) return badRequest(res, "id");
+
+  const quartel_id = identifier(req.body.quartel_id);
+  if (!quartel_id) return badRequest(res, "quartel_id");
+  const bombeiro_id = identifier(req.body.bombeiro_id);
+  if (!bombeiro_id) return badRequest(res, "bombeiro_id");
+  const justificativa = optionalText(req.body.justificativa, 250);
+  if (justificativa === undefined) return badRequest(res, "justificativa");
+  const rawDate = isoDate(req.body.data);
+  if (!rawDate) return badRequest(res, "data");
 
   if (isDbConnected && pool) {
     try {
@@ -752,8 +1015,9 @@ app.post("/api/fmos", async (req, res) => {
   res.json(dataset);
 });
 
-app.delete("/api/fmos/:id", async (req, res) => {
-  const { id } = req.params;
+app.delete("/api/fmos/:id", requireAdmin, async (req, res) => {
+  const id = paramId(req, res);
+  if (!id) return;
   if (isDbConnected && pool) {
     try {
       await pool.query("DELETE FROM fmos WHERE id = $1", [id]);
@@ -771,17 +1035,24 @@ app.delete("/api/fmos/:id", async (req, res) => {
 
 // --- ADMINISTRAÇÃO E AUTENTICAÇÃO ---
 app.post("/api/admins/login", async (req, res) => {
-  const { username, password } = req.body;
+  if (isLoginRateLimited(req.ip || "unknown")) {
+    return res.status(429).json({ error: "Muitas tentativas de login. Tente novamente mais tarde." });
+  }
+
+  const username = text(req.body.username, 50);
+  const password = text(req.body.password, 200);
   if (!username || !password) {
     return res.status(400).json({ error: "Preencha usuário e senha." });
   }
 
+  const cleanUser = username.toLowerCase();
+
   if (isDbConnected && pool) {
     try {
-      const result = await pool.query("SELECT * FROM administradores WHERE username = $1", [username.toLowerCase().trim()]);
-      if (result.rows.length > 0 && result.rows[0].password === password) {
-        const admin = result.rows[0];
-        return res.json({ success: true, admin: { username: admin.username, nome: admin.nome } });
+      const result = await pool.query("SELECT username, nome, password FROM administradores WHERE username = $1", [cleanUser]);
+      if (result.rows.length > 0 && verifyPassword(password, result.rows[0].password)) {
+        const admin = { username: result.rows[0].username, nome: result.rows[0].nome };
+        return res.json({ success: true, admin, token: createSession(admin) });
       }
       return res.status(401).json({ error: "Credenciais de administrador incorretas." });
     } catch (e) {
@@ -790,20 +1061,40 @@ app.post("/api/admins/login", async (req, res) => {
     }
   }
 
-  const found = mockAdmins.find(a => a.username.toLowerCase().trim() === username.toLowerCase().trim() && a.password === password);
-  if (found) {
-    return res.json({ success: true, admin: { username: found.username, nome: found.nome } });
+  const found = mockAdmins.find(a => a.username === cleanUser);
+  if (found && verifyPassword(password, found.password)) {
+    const admin = { username: found.username, nome: found.nome };
+    return res.json({ success: true, admin, token: createSession(admin) });
   }
   return res.status(401).json({ error: "Credenciais de administrador incorretas." });
 });
 
-app.post("/api/admins/register", async (req, res) => {
-  const { username, nome, password } = req.body;
+app.get("/api/admins/session", requireAdmin, (req, res) => {
+  const session = readSession(req)!;
+  res.json({ success: true, admin: { username: session.username, nome: session.nome } });
+});
+
+app.post("/api/admins/logout", requireAdmin, (req, res) => {
+  const token = (req.headers.authorization || "").slice("Bearer ".length).trim();
+  sessions.delete(token);
+  res.json({ success: true });
+});
+
+app.post("/api/admins/register", requireAdmin, async (req, res) => {
+  const username = text(req.body.username, 50);
+  const nome = text(req.body.nome, 100);
+  const password = text(req.body.password, 200);
   if (!username || !nome || !password) {
     return res.status(400).json({ error: "Preencha usuário, nome e senha." });
   }
+  if (!/^[a-z0-9_.-]+$/i.test(username)) {
+    return res.status(400).json({ error: "Usuário deve conter apenas letras, números, ponto, hífen ou sublinhado." });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: "A senha deve ter ao menos 8 caracteres." });
+  }
 
-  const cleanUser = username.toLowerCase().trim();
+  const cleanUser = username.toLowerCase();
 
   if (isDbConnected && pool) {
     try {
@@ -814,7 +1105,7 @@ app.post("/api/admins/register", async (req, res) => {
       await pool.query(`
         INSERT INTO administradores (username, nome, password) 
         VALUES ($1, $2, $3)
-      `, [cleanUser, nome, password]);
+      `, [cleanUser, nome, hashPassword(password)]);
       return res.json({ success: true, admin: { username: cleanUser, nome } });
     } catch (e) {
       console.error(e);
@@ -822,15 +1113,15 @@ app.post("/api/admins/register", async (req, res) => {
     }
   }
 
-  const exists = mockAdmins.find(a => a.username.toLowerCase().trim() === cleanUser);
+  const exists = mockAdmins.find(a => a.username === cleanUser);
   if (exists) {
     return res.status(400).json({ error: "Nome de usuário administrador já cadastrado." });
   }
-  mockAdmins.push({ username: cleanUser, nome, password });
+  mockAdmins.push({ username: cleanUser, nome, password: hashPassword(password) });
   res.json({ success: true, admin: { username: cleanUser, nome } });
 });
 
-app.get("/api/admins", async (req, res) => {
+app.get("/api/admins", requireAdmin, async (req, res) => {
   if (isDbConnected && pool) {
     try {
       const result = await pool.query("SELECT username, nome, criado_em FROM administradores ORDER BY nome");

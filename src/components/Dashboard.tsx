@@ -18,7 +18,7 @@ interface DashboardProps {
   mural: MuralPost[];
   afastamentos?: Afastamento[];
   fmos?: Fmo[];
-  dbStatus: { connected: boolean; database: string; connectionString: string };
+  dbStatus: { connected: boolean; database: string };
   onCreateMural: (title: string, content: string, re: string) => Promise<void>;
   onDeleteMural: (id: string) => Promise<void>;
   onUpdateViaturaStatus: (id: string, status: string, escala_atual: string) => Promise<void>;
@@ -288,7 +288,7 @@ export default function Dashboard({
                 <span className={`w-2 h-2 rounded-full ${dbStatus.connected ? "bg-emerald-400" : "bg-blue-400 animate-pulse"}`}></span>
                 {dbStatus.connected ? "SUPABASE CONECTADO" : "SALA LOCAL SEGURA"}
               </div>
-              <div className="text-slate-400 font-mono text-[10px] truncate max-w-[200px]" title={dbStatus.connectionString}>
+              <div className="text-slate-400 font-mono text-[10px] truncate max-w-[200px]" title={dbStatus.database}>
                 {dbStatus.connected ? "PostgreSQL Proativo Ativado" : "Desenvolvimento Sem Fio"}
               </div>
             </div>
